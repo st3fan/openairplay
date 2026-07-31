@@ -14,7 +14,7 @@ use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::rtsp::{read_request, Request, Response};
-use crate::session::{AudioObserver, Session};
+use crate::session::{AudioObserver, Session, SessionSlot};
 use crate::{crypto, Config};
 
 pub const SERVER_ID: &str = "AirTunes/105.1";
@@ -33,13 +33,16 @@ pub async fn serve_with_observer(
     config: Arc<Config>,
     observer: Option<AudioObserver>,
 ) -> io::Result<()> {
+    // Shared across connections so only one client can stream at a time.
+    let slot = SessionSlot::new();
     loop {
         let (stream, peer) = listener.accept().await?;
         let config = config.clone();
         let observer = observer.clone();
+        let slot = slot.clone();
         tokio::spawn(async move {
             info!("[{peer}] connected");
-            if let Err(e) = handle_connection(stream, peer, config, observer).await {
+            if let Err(e) = handle_connection(stream, peer, config, observer, slot).await {
                 warn!("[{peer}] connection error: {e}");
             }
             info!("[{peer}] disconnected");
@@ -52,11 +55,12 @@ async fn handle_connection(
     peer: SocketAddr,
     config: Arc<Config>,
     observer: Option<AudioObserver>,
+    slot: SessionSlot,
 ) -> io::Result<()> {
     let local_addr = stream.local_addr()?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    let mut session = Session::new(observer, config.alsa_device.clone());
+    let mut session = Session::new(observer, config.alsa_device.clone(), peer.ip(), slot);
 
     while let Some(request) = read_request(&mut reader).await? {
         log_request(&peer, &request);

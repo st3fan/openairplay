@@ -111,6 +111,20 @@ pub fn classify_control(datagram: &[u8]) -> Option<ControlKind> {
     })
 }
 
+/// Build a RAOP retransmit ("resend") request for `count` packets starting at
+/// `first`, to be sent to the client's control port. Layout matches
+/// shairport-sync: `80 D5`, our sequence (always 1), the first missing
+/// sequence, and the count — all big-endian.
+pub fn resend_request(first: u16, count: u16) -> [u8; 8] {
+    let mut req = [0u8; 8];
+    req[0] = 0x80;
+    req[1] = 0x55 | 0x80; // 0xD5, Apple "resend"
+    req[2..4].copy_from_slice(&1u16.to_be_bytes());
+    req[4..6].copy_from_slice(&first.to_be_bytes());
+    req[6..8].copy_from_slice(&count.to_be_bytes());
+    req
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +244,15 @@ mod tests {
         assert_eq!(
             classify_control(&[0x80, 0x11]),
             Some(ControlKind::Other(0x11))
+        );
+    }
+
+    #[test]
+    fn encodes_resend_request() {
+        // Request 3 packets starting at seq 0x1234.
+        assert_eq!(
+            resend_request(0x1234, 3),
+            [0x80, 0xD5, 0x00, 0x01, 0x12, 0x34, 0x00, 0x03]
         );
     }
 }

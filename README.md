@@ -20,12 +20,16 @@ key, binds the three UDP channels, and receives, AES-CBC-decrypts, and
 sanity-checks the incoming audio packets.
 
 **Milestone 3 (sound) — complete.** Decodes the ALAC frames and plays them to
-an ALSA device: naive playback (small prebuffer, arrival order, no jitter
-buffer or clock sync yet). Verified end-to-end on real hardware — the
-played-out PCM matches the source audio byte-for-byte. Use `--alsa-device` to
-pick the output (default `default`) or `--no-audio` for decode-only.
-Sequence-ordered buffering + retransmits (milestone 4) and timing/clock sync
-(milestone 5) are still to come.
+an ALSA device. Use `--alsa-device` to pick the output (default `default`) or
+`--no-audio` for decode-only.
+
+**Milestone 4 (robustness) — complete.** A sequence-ordered jitter buffer
+reorders UDP packets and requests retransmits for gaps (recovering lost
+packets); unrecoverable gaps are concealed with silence to keep timing.
+Software volume from `SET_PARAMETER`, FLUSH clears buffered audio, u16
+sequence wrap is handled, and only one client may stream at a time (a second
+is refused `453`). Retransmit recovery and volume were verified on real
+hardware. Clock/timing sync (milestone 5) is still to come.
 
 ## Build & test
 

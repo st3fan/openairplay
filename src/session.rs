@@ -2,8 +2,12 @@
 //! bound UDP channels, and the audio-receiver task that decrypts incoming
 //! packets.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -12,10 +16,44 @@ use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
 use crate::crypto;
+use crate::jitter::{Delivery, JitterBuffer};
 use crate::player::{Player, PlayerSender};
 use crate::rtp::{self, AudioPacket};
 use crate::rtsp::{Request, Response};
 use crate::sdp::{AlacConfig, Sdp};
+
+/// How often the audio task services retransmit requests and forced skips.
+const SERVICE_INTERVAL: Duration = Duration::from_millis(20);
+/// Minimum spacing between resend requests for the same sequence number.
+const RESEND_BACKOFF: Duration = Duration::from_millis(80);
+
+/// A single-streaming-session gate shared across RTSP connections. AirPlay 1
+/// senders assume exclusive use of the receiver; a second one that reaches
+/// SETUP while another is streaming is refused.
+#[derive(Clone, Default)]
+pub struct SessionSlot(Arc<AtomicBool>);
+
+impl SessionSlot {
+    pub fn new() -> SessionSlot {
+        SessionSlot(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Take the slot if free. The returned guard releases it on drop.
+    fn try_acquire(&self) -> Option<SlotGuard> {
+        self.0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| SlotGuard(self.0.clone()))
+    }
+}
+
+struct SlotGuard(Arc<AtomicBool>);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// A decrypted audio packet, surfaced to an optional observer. Milestone 2
 /// uses this to prove the crypto path in tests and logs; milestone 3 will
@@ -46,6 +84,14 @@ pub struct Session {
     /// ALSA device to play to, or `None` for decode-only (`--no-audio`).
     audio_device: Option<String>,
     player: Option<Player>,
+    /// Signals the audio task to flush its jitter buffer to a given sequence
+    /// (or re-anchor when `None`).
+    flush_tx: Option<tokio::sync::mpsc::UnboundedSender<Option<u16>>>,
+    /// The IP the client connected from, for addressing resend requests.
+    peer_ip: IpAddr,
+    /// Shared single-session gate and this session's guard once acquired.
+    slot: SessionSlot,
+    slot_guard: Option<SlotGuard>,
     /// Local UDP ports handed to the client in the SETUP response.
     local_audio_port: u16,
     local_control_port: u16,
@@ -53,11 +99,20 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(observer: Option<AudioObserver>, audio_device: Option<String>) -> Self {
+    pub fn new(
+        observer: Option<AudioObserver>,
+        audio_device: Option<String>,
+        peer_ip: IpAddr,
+        slot: SessionSlot,
+    ) -> Self {
         Session {
             observer,
             audio_device,
             player: None,
+            flush_tx: None,
+            peer_ip,
+            slot,
+            slot_guard: None,
             params: None,
             tasks: Vec::new(),
             local_audio_port: 0,
@@ -120,6 +175,16 @@ impl Session {
             warn!("SETUP before ANNOUNCE");
             return Response::new(455, "Method Not Valid in This State");
         };
+        // One streaming session at a time; refuse a second client.
+        if self.slot_guard.is_none() {
+            match self.slot.try_acquire() {
+                Some(guard) => self.slot_guard = Some(guard),
+                None => {
+                    warn!("SETUP refused: another session is already streaming");
+                    return Response::new(453, "Not Enough Bandwidth");
+                }
+            }
+        }
         let Some(transport) = request.headers.get("Transport") else {
             return Response::new(400, "Bad Request");
         };
@@ -161,11 +226,20 @@ impl Session {
         let player_sender = player.sender();
         self.player = Some(player);
 
+        // Share the control socket: the audio task sends resend requests on it
+        // while the control task reads sync packets.
+        let control = Arc::new(control);
+        let client_control = SocketAddr::new(self.peer_ip, control_port);
+        let (flush_tx, flush_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.flush_tx = Some(flush_tx);
         self.tasks.push(tokio::spawn(audio_receiver(
             audio,
             params,
             self.observer.clone(),
             Some(player_sender),
+            control.clone(),
+            client_control,
+            flush_rx,
         )));
         self.tasks.push(tokio::spawn(control_receiver(control)));
         self.tasks.push(tokio::spawn(timing_receiver(timing)));
@@ -199,12 +273,20 @@ impl Session {
             "TEARDOWN" => {
                 self.stop_tasks();
                 self.player = None;
+                self.flush_tx = None;
+                self.slot_guard = None; // release the streaming slot immediately
                 info!("TEARDOWN: session closed");
                 Some(Response::ok())
             }
             "FLUSH" => {
-                if let Some(player) = &self.player {
-                    player.flush();
+                // Clear buffered audio up to the RTP-Info seq (if any) so a
+                // seek/pause doesn't play stale audio.
+                let flush_to = request
+                    .headers
+                    .get("RTP-Info")
+                    .and_then(|info| transport_param(info, "seq"));
+                if let Some(tx) = &self.flush_tx {
+                    let _ = tx.send(flush_to);
                 }
                 Some(Response::ok())
             }
@@ -212,7 +294,12 @@ impl Session {
                 let body = String::from_utf8_lossy(&request.body);
                 for line in body.lines() {
                     if let Some(v) = line.trim().strip_prefix("volume:") {
-                        debug!("SET_PARAMETER volume {}", v.trim());
+                        if let Ok(db) = v.trim().parse::<f32>() {
+                            debug!("SET_PARAMETER volume {db} dB");
+                            if let Some(player) = &self.player {
+                                player.set_volume_db(db);
+                            }
+                        }
                     }
                 }
                 Some(Response::ok())
@@ -267,79 +354,196 @@ async fn bind_three(ip: IpAddr) -> io::Result<(UdpSocket, UdpSocket, UdpSocket)>
     Ok((bind(ip).await?, bind(ip).await?, bind(ip).await?))
 }
 
+/// Rate-limits resend requests so each missing sequence is asked for at most
+/// once per [`RESEND_BACKOFF`].
+#[derive(Default)]
+struct ResendTracker {
+    last: HashMap<u16, Instant>,
+}
+
+impl ResendTracker {
+    /// Return the subset of `missing` due for a (re)request now, recording the
+    /// request time. Entries no longer missing are pruned.
+    fn due(&mut self, missing: &[u16], now: Instant) -> Vec<u16> {
+        let live: std::collections::HashSet<u16> = missing.iter().copied().collect();
+        self.last.retain(|seq, _| live.contains(seq));
+        let mut due = Vec::new();
+        for &seq in missing {
+            let ready = self
+                .last
+                .get(&seq)
+                .is_none_or(|&t| now.duration_since(t) >= RESEND_BACKOFF);
+            if ready {
+                self.last.insert(seq, now);
+                due.push(seq);
+            }
+        }
+        due
+    }
+
+    fn clear(&mut self) {
+        self.last.clear();
+    }
+}
+
 async fn audio_receiver(
     socket: UdpSocket,
     params: StreamParams,
     observer: Option<AudioObserver>,
     player: Option<PlayerSender>,
+    control: Arc<UdpSocket>,
+    client_control: SocketAddr,
+    mut flush_rx: tokio::sync::mpsc::UnboundedReceiver<Option<u16>>,
 ) {
     // Real RAOP uses 352-frame packets (~1.4 KiB), but the announced frame
     // length can be larger; 16 KiB holds a 4096-frame 16-bit stereo packet
     // and then some. Too-small a buffer silently truncates the datagram and
     // the payload fails to decode.
     let mut buf = vec![0u8; 16 * 1024];
+    let frames_per_packet = params.alac.frames_per_packet;
+    let mut jitter = JitterBuffer::default();
+    let mut resend = ResendTracker::default();
+    // (seq, timestamp) of the first packet, to derive delivered timestamps.
+    let mut anchor: Option<(u16, u32)> = None;
     let mut received: u64 = 0;
-    let mut decrypt_ok: u64 = 0;
+    let mut service = tokio::time::interval(SERVICE_INTERVAL);
+
     loop {
-        let n = match socket.recv(&mut buf).await {
-            Ok(n) => n,
-            Err(e) => {
-                warn!("audio socket error: {e}");
-                return;
-            }
-        };
-        let Some(packet) = AudioPacket::parse(&buf[..n]) else {
-            debug!("audio: ignored {n}-byte non-audio datagram");
-            continue;
-        };
-        received += 1;
+        tokio::select! {
+            result = socket.recv(&mut buf) => {
+                let n = match result {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!("audio socket error: {e}");
+                        return;
+                    }
+                };
+                let Some(packet) = AudioPacket::parse(&buf[..n]) else {
+                    debug!("audio: ignored {n}-byte non-audio datagram");
+                    continue;
+                };
+                received += 1;
+                anchor.get_or_insert((packet.sequence, packet.timestamp));
 
-        let frame = if params.encrypted {
-            rtp::decrypt_audio(packet.payload, &params.key, &params.iv)
-        } else {
-            packet.payload.to_vec()
-        };
-        let looks_like_alac = rtp::looks_like_alac_stereo(&frame);
-        if looks_like_alac {
-            decrypt_ok += 1;
-        }
-
-        if received <= 3 || received.is_multiple_of(250) {
-            info!(
-                "audio: {received} pkts, seq={} ts={} {} bytes, alac-ok {decrypt_ok}/{received}",
-                packet.sequence,
-                packet.timestamp,
-                frame.len()
-            );
-        }
-
-        // Forward to playback and/or the test observer. Only clone when both
-        // want the bytes; the production path (player only) moves them.
-        match (&player, &observer) {
-            (Some(player), Some(observer)) => {
-                player.frame(frame.clone());
-                let _ = observer.send(DecryptedAudio {
-                    sequence: packet.sequence,
-                    timestamp: packet.timestamp,
-                    looks_like_alac,
-                    frame,
-                });
+                let frame = if params.encrypted {
+                    rtp::decrypt_audio(packet.payload, &params.key, &params.iv)
+                } else {
+                    packet.payload.to_vec()
+                };
+                if received <= 3 || received.is_multiple_of(250) {
+                    info!(
+                        "audio: {received} pkts, seq={} ts={} {} bytes",
+                        packet.sequence, packet.timestamp, frame.len()
+                    );
+                }
+                jitter.insert(packet.sequence, frame);
+                drain_deliveries(&mut jitter, &player, &observer, anchor, frames_per_packet);
             }
-            (Some(player), None) => player.frame(frame),
-            (None, Some(observer)) => {
-                let _ = observer.send(DecryptedAudio {
-                    sequence: packet.sequence,
-                    timestamp: packet.timestamp,
-                    looks_like_alac,
-                    frame,
-                });
+            _ = service.tick() => {
+                drain_deliveries(&mut jitter, &player, &observer, anchor, frames_per_packet);
+                request_resends(&jitter, &mut resend, &control, client_control).await;
             }
-            (None, None) => {}
+            flush = flush_rx.recv() => {
+                let Some(flush_to) = flush else { return }; // session dropped
+                debug!("audio: FLUSH to {flush_to:?}");
+                jitter.reset(flush_to);
+                resend.clear();
+                anchor = None;
+                if let Some(player) = &player {
+                    player.flush();
+                }
+            }
         }
     }
 }
 
-async fn control_receiver(socket: UdpSocket) {
+/// Release ready packets from the jitter buffer to the player (and test
+/// observer), concealing losses with silence.
+fn drain_deliveries(
+    jitter: &mut JitterBuffer,
+    player: &Option<PlayerSender>,
+    observer: &Option<AudioObserver>,
+    anchor: Option<(u16, u32)>,
+    frames_per_packet: u32,
+) {
+    for delivery in jitter.pop_ready() {
+        match delivery {
+            Delivery::Packet { seq, frame } => {
+                let looks_like_alac = rtp::looks_like_alac_stereo(&frame);
+                match (player, observer) {
+                    (Some(player), Some(observer)) => {
+                        player.frame(frame.clone());
+                        let _ = observer.send(decrypted(
+                            seq,
+                            frame,
+                            looks_like_alac,
+                            anchor,
+                            frames_per_packet,
+                        ));
+                    }
+                    (Some(player), None) => player.frame(frame),
+                    (None, Some(observer)) => {
+                        let _ = observer.send(decrypted(
+                            seq,
+                            frame,
+                            looks_like_alac,
+                            anchor,
+                            frames_per_packet,
+                        ));
+                    }
+                    (None, None) => {}
+                }
+            }
+            Delivery::Lost { seq } => {
+                debug!("audio: concealing lost packet seq={seq}");
+                if let Some(player) = player {
+                    player.silence();
+                }
+            }
+        }
+    }
+}
+
+fn decrypted(
+    seq: u16,
+    frame: Vec<u8>,
+    looks_like_alac: bool,
+    anchor: Option<(u16, u32)>,
+    frames_per_packet: u32,
+) -> DecryptedAudio {
+    // RAOP timestamps advance by frames_per_packet per sequence number.
+    let timestamp = anchor.map_or(0, |(a_seq, a_ts)| {
+        let ahead = crate::jitter::seq_diff(seq, a_seq).max(0) as u32;
+        a_ts.wrapping_add(ahead.wrapping_mul(frames_per_packet))
+    });
+    DecryptedAudio {
+        sequence: seq,
+        timestamp,
+        looks_like_alac,
+        frame,
+    }
+}
+
+/// Ask the client to resend any missing packets, respecting per-seq backoff.
+async fn request_resends(
+    jitter: &JitterBuffer,
+    resend: &mut ResendTracker,
+    control: &UdpSocket,
+    client_control: SocketAddr,
+) {
+    let missing = jitter.missing();
+    if missing.is_empty() {
+        return;
+    }
+    for seq in resend.due(&missing, Instant::now()) {
+        let req = rtp::resend_request(seq, 1);
+        if let Err(e) = control.send_to(&req, client_control).await {
+            debug!("audio: resend request for seq={seq} failed: {e}");
+        }
+    }
+}
+
+async fn control_receiver(socket: Arc<UdpSocket>) {
     let mut buf = [0u8; 2048];
     while let Ok(n) = socket.recv(&mut buf).await {
         if let Some(kind) = rtp::classify_control(&buf[..n]) {
