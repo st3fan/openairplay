@@ -28,8 +28,15 @@ reorders UDP packets and requests retransmits for gaps (recovering lost
 packets); unrecoverable gaps are concealed with silence to keep timing.
 Software volume from `SET_PARAMETER`, FLUSH clears buffered audio, u16
 sequence wrap is handled, and only one client may stream at a time (a second
-is refused `453`). Retransmit recovery and volume were verified on real
-hardware. Clock/timing sync (milestone 5) is still to come.
+is refused `453`).
+
+**Milestone 5 (timing & sync) — complete.** The NTP timing channel and sync
+packets drive a clock model that computes when each frame should reach the
+DAC, giving a latency-correct playback start; ALSA queue depth is nudged to
+counter clock drift. Verified on real hardware. This completes the roadmap in
+[`notes/design.md`](notes/design.md): the receiver does the full RAOP audio
+path — discovery, handshake, decryption, ALAC decode, robust buffered
+playback, and clock sync.
 
 ## Build & test
 

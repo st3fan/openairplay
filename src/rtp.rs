@@ -125,6 +125,73 @@ pub fn resend_request(first: u16, count: u16) -> [u8; 8] {
     req
 }
 
+/// Build an NTP timing request (`80 D2`) to send to the client's timing port.
+/// All three NTP fields are zero; the client fills in its receive/transmit
+/// times in the reply. Record the local send time to pair with the reply.
+pub fn timing_request() -> [u8; 32] {
+    let mut req = [0u8; 32];
+    req[0] = 0x80;
+    req[1] = 0x52 | 0x80; // 0xD2, timing request
+    req[2..4].copy_from_slice(&7u16.to_be_bytes()); // seqno, shairport uses 7
+    req
+}
+
+/// The two client-clock instants recovered from a `0xd3` timing reply, in
+/// nanoseconds: `receive` (t2) and `transmit` (t3).
+#[derive(Debug, PartialEq, Eq)]
+pub struct TimingReply {
+    pub receive_ns: u64,
+    pub transmit_ns: u64,
+}
+
+/// Parse a `0xd3` timing reply (32 bytes): NTP receive at `[16..24]` and NTP
+/// transmit at `[24..32]`, each a 32.32 seconds/fraction pair.
+pub fn parse_timing_reply(datagram: &[u8]) -> Option<TimingReply> {
+    if datagram.len() < 32 || datagram[1] & 0x7f != 0x53 {
+        return None;
+    }
+    let ntp = |o: usize| {
+        crate::clock::ntp_to_ns(
+            u32::from_be_bytes(datagram[o..o + 4].try_into().unwrap()),
+            u32::from_be_bytes(datagram[o + 4..o + 8].try_into().unwrap()),
+        )
+    };
+    Some(TimingReply {
+        receive_ns: ntp(16),
+        transmit_ns: ntp(24),
+    })
+}
+
+/// A parsed `0xd4` sync packet.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SyncInfo {
+    /// Client-clock instant of the sync, in nanoseconds.
+    pub remote_time_ns: u64,
+    /// RTP timestamp at the DAC at that instant (current minus latency).
+    pub rtp_at_dac: u32,
+    /// The "current" RTP timestamp (used to derive latency = current − at_dac).
+    pub rtp_current: u32,
+}
+
+/// Parse a `0xd4` sync packet (20 bytes): `rtp_at_dac` at `[4..8]`, NTP
+/// `remote_time` at `[8..16]`, `rtp_current` at `[16..20]`.
+pub fn parse_sync(datagram: &[u8]) -> Option<SyncInfo> {
+    if datagram.len() < 20 || datagram[1] & 0x7f != 0x54 {
+        return None;
+    }
+    let rtp_at_dac = u32::from_be_bytes(datagram[4..8].try_into().unwrap());
+    let remote_time_ns = crate::clock::ntp_to_ns(
+        u32::from_be_bytes(datagram[8..12].try_into().unwrap()),
+        u32::from_be_bytes(datagram[12..16].try_into().unwrap()),
+    );
+    let rtp_current = u32::from_be_bytes(datagram[16..20].try_into().unwrap());
+    Some(SyncInfo {
+        remote_time_ns,
+        rtp_at_dac,
+        rtp_current,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +321,52 @@ mod tests {
             resend_request(0x1234, 3),
             [0x80, 0xD5, 0x00, 0x01, 0x12, 0x34, 0x00, 0x03]
         );
+    }
+
+    #[test]
+    fn encodes_timing_request() {
+        let req = timing_request();
+        assert_eq!(req[0], 0x80);
+        assert_eq!(req[1], 0xD2);
+        assert_eq!(&req[2..4], &7u16.to_be_bytes());
+        assert!(req[4..].iter().all(|&b| b == 0), "NTP fields must be zero");
+    }
+
+    #[test]
+    fn parses_timing_reply() {
+        let mut pkt = [0u8; 32];
+        pkt[0] = 0x80;
+        pkt[1] = 0xD3;
+        pkt[16..20].copy_from_slice(&5u32.to_be_bytes()); // receive: 5.5 s
+        pkt[20..24].copy_from_slice(&0x8000_0000u32.to_be_bytes());
+        pkt[24..28].copy_from_slice(&6u32.to_be_bytes()); // transmit: 6.0 s
+        let reply = parse_timing_reply(&pkt).unwrap();
+        assert_eq!(reply.receive_ns, 5_500_000_000);
+        assert_eq!(reply.transmit_ns, 6_000_000_000);
+        assert!(parse_timing_reply(&pkt[..20]).is_none(), "too short");
+    }
+
+    #[test]
+    fn parses_sync_packet() {
+        let mut pkt = [0u8; 20];
+        pkt[0] = 0x80;
+        pkt[1] = 0xD4;
+        pkt[4..8].copy_from_slice(&1000u32.to_be_bytes()); // rtp at DAC
+        pkt[8..12].copy_from_slice(&10u32.to_be_bytes()); // remote time: 10 s
+        pkt[16..20].copy_from_slice(&12205u32.to_be_bytes()); // rtp current
+        let sync = parse_sync(&pkt).unwrap();
+        assert_eq!(sync.rtp_at_dac, 1000);
+        assert_eq!(sync.remote_time_ns, 10_000_000_000);
+        assert_eq!(sync.rtp_current, 12205);
+        // latency = current − at_dac = 11205 frames.
+        assert_eq!(sync.rtp_current - sync.rtp_at_dac, 11205);
+    }
+
+    #[test]
+    fn sync_ignores_wrong_type() {
+        let pkt = [
+            0x80, 0xD3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert!(parse_sync(&pkt).is_none());
     }
 }

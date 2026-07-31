@@ -1,4 +1,5 @@
 pub mod avahi;
+pub mod clock;
 pub mod crypto;
 pub mod decode;
 pub mod jitter;
