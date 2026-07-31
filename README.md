@@ -61,16 +61,17 @@ cargo test   # no audio hardware needed; tests never open ALSA
 #                      (default: auto-detected from /sys/class/net)
 #   --alsa-device DEV  ALSA output device (default "default")
 #   --no-audio         decode only, don't open an audio device
-#   --no-avahi         do not spawn avahi-publish-service
+#   --no-avahi         do not advertise the service at all
 
 # Verbose logging:
 RUST_LOG=debug ./target/debug/openairplay
 ```
 
-Avahi advertisement requires `avahi-publish-service` (Debian/Ubuntu:
-`avahi-utils`) and a running `avahi-daemon`. Without them the receiver still
-serves RTSP; it just won't be discoverable, and you can connect by address
-for testing.
+The receiver advertises `_raop._tcp` by registering directly with the
+`avahi-daemon` over the system D-Bus — no `avahi-utils` needed. It just needs
+a running `avahi-daemon` (and access to the system bus). If that isn't
+available the receiver still serves RTSP; it just won't be discoverable, and
+you can connect by address for testing.
 
 ## Notes
 
