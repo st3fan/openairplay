@@ -7,6 +7,8 @@ license = "MIT"
 
 [dependencies]
 aes = "0.8"
+alac = "0.5"
+alsa = "0.12"
 base64 = "0.22"
 cbc = "0.1"
 env_logger = "0.11"

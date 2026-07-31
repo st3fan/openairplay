@@ -21,6 +21,7 @@ async fn start_server() -> SocketAddr {
         name: "Test".to_string(),
         port: addr.port(),
         mac: MAC,
+        alsa_device: None, // decode-only; tests never touch hardware
     });
     tokio::spawn(server::serve(listener, config));
     addr
