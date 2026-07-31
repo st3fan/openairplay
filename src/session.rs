@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 use log::{debug, info, warn};
 use tokio::net::UdpSocket;
@@ -336,19 +336,23 @@ fn decrypt_stream_key(
     rsaaeskey_b64: &str,
     aesiv_b64: &str,
 ) -> Result<([u8; 16], [u8; 16]), String> {
-    let iv_bytes = STANDARD
-        .decode(aesiv_b64)
-        .map_err(|_| "aesiv is not valid base64".to_string())?;
+    let iv_bytes = sdp_base64(aesiv_b64).map_err(|_| "aesiv is not valid base64".to_string())?;
     let iv: [u8; 16] = iv_bytes
         .as_slice()
         .try_into()
         .map_err(|_| format!("aesiv is {} bytes, wanted 16", iv_bytes.len()))?;
 
-    let key_ct = STANDARD
-        .decode(rsaaeskey_b64)
-        .map_err(|_| "rsaaeskey is not valid base64".to_string())?;
+    let key_ct =
+        sdp_base64(rsaaeskey_b64).map_err(|_| "rsaaeskey is not valid base64".to_string())?;
     let key = crypto::decrypt_aes_key(&key_ct).map_err(|e| e.to_string())?;
     Ok((key, iv))
+}
+
+/// Decode a base64 value from an ANNOUNCE SDP field. Apple sends `aesiv` and
+/// `rsaaeskey` on the standard alphabet but *without* `=` padding; tolerate
+/// its presence or absence so both stock senders and padded encoders work.
+fn sdp_base64(value: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    STANDARD_NO_PAD.decode(value.trim().trim_end_matches('='))
 }
 
 fn transport_param(header: &str, name: &str) -> Option<u16> {
@@ -605,6 +609,7 @@ async fn timing_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
 
     #[test]
     fn extracts_transport_ports() {
@@ -619,5 +624,17 @@ mod tests {
         // Valid base64 but only 8 bytes.
         let err = decrypt_stream_key("AAECAwQF", &STANDARD.encode([0u8; 8])).unwrap_err();
         assert!(err.contains("aesiv is 8 bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn sdp_base64_tolerates_missing_padding() {
+        // Apple sends aesiv/rsaaeskey without '=' padding; both forms must
+        // decode to the same 16 bytes. (This is the bug a real Mac hit.)
+        let iv: [u8; 16] = std::array::from_fn(|i| i as u8);
+        let padded = STANDARD.encode(iv); // "...=="
+        let unpadded = padded.trim_end_matches('=');
+        assert_eq!(unpadded.len(), 22, "16 bytes unpadded is 22 base64 chars");
+        assert_eq!(sdp_base64(&padded).unwrap(), iv);
+        assert_eq!(sdp_base64(unpadded).unwrap(), iv);
     }
 }

@@ -90,7 +90,9 @@ fn wrap_key() -> String {
     let ct = public
         .encrypt(&mut rng, Oaep::new::<sha1::Sha1>(), &KEY)
         .unwrap();
-    STANDARD.encode(ct)
+    // Stock Apple senders omit the '=' padding — encode the same way so the
+    // test exercises the real wire format.
+    STANDARD.encode(ct).trim_end_matches('=').to_string()
 }
 
 fn encrypt_audio(plaintext: &[u8]) -> Vec<u8> {
@@ -116,7 +118,7 @@ async fn full_handshake_and_audio_decrypt() {
          a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\n\
          a=rsaaeskey:{}\r\na=aesiv:{}\r\n",
         wrap_key(),
-        STANDARD.encode(IV)
+        STANDARD.encode(IV).trim_end_matches('=') // unpadded, like a real sender
     );
     let announce = format!(
         "ANNOUNCE rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 1\r\n\
