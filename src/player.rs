@@ -17,9 +17,14 @@ use log::{debug, info, warn};
 
 use crate::decode::AlacDecoder;
 use crate::sdp::AlacConfig;
+use crate::volume;
 
 enum Command {
     Frame(Vec<u8>),
+    /// A lost packet: emit one packet of silence to keep timing aligned.
+    Silence,
+    /// New linear gain in `[0.0, 1.0]`.
+    Volume(f32),
     Flush,
     Stop,
 }
@@ -35,6 +40,16 @@ impl PlayerSender {
     /// Queue a decrypted ALAC frame for playback.
     pub fn frame(&self, packet: Vec<u8>) {
         let _ = self.tx.send(Command::Frame(packet));
+    }
+
+    /// Signal a lost packet so the player conceals it with silence.
+    pub fn silence(&self) {
+        let _ = self.tx.send(Command::Silence);
+    }
+
+    /// Drop buffered audio and re-arm the prebuffer (used on FLUSH).
+    pub fn flush(&self) {
+        let _ = self.tx.send(Command::Flush);
     }
 }
 
@@ -79,10 +94,10 @@ impl Player {
         }
     }
 
-    /// Drop buffered audio and re-arm the prebuffer (used on FLUSH).
-    pub fn flush(&self) {
+    /// Set playback volume from an AirPlay dB attenuation.
+    pub fn set_volume_db(&self, db: f32) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(Command::Flush);
+            let _ = tx.send(Command::Volume(volume::db_to_gain(db)));
         }
     }
 }
@@ -148,7 +163,10 @@ fn run(
         }
     };
 
+    // One packet of silence, for concealing a lost packet.
+    let silence_frame = vec![0i16; config.frames_per_packet as usize * decoder.channels()];
     let mut prebuffer = Prebuffer::new(prebuffer_packets);
+    let mut gain: f32 = 1.0;
     let mut decoded_packets: u64 = 0;
     while let Ok(command) = rx.recv() {
         // Preempt a queued backlog on teardown rather than draining it in
@@ -169,11 +187,16 @@ fn run(
                 if decoded_packets <= 3 || decoded_packets.is_multiple_of(500) {
                     debug!("player: {decoded_packets} packets decoded");
                 }
-                if let Some(chunk) = prebuffer.push(pcm) {
-                    if let Some(out) = output.as_mut() {
-                        out.write(&chunk);
-                    }
-                }
+                let mut pcm = pcm.to_vec();
+                volume::apply_gain(&mut pcm, gain);
+                play(&mut prebuffer, output.as_mut(), pcm);
+            }
+            Command::Silence => {
+                play(&mut prebuffer, output.as_mut(), silence_frame.clone());
+            }
+            Command::Volume(g) => {
+                debug!("player: gain {g:.4}");
+                gain = g;
             }
             Command::Flush => {
                 prebuffer.reset();
@@ -189,6 +212,16 @@ fn run(
 
 fn drain(rx: Receiver<Command>) {
     while rx.recv().is_ok() {}
+}
+
+/// Push one packet of PCM through the prebuffer and write whatever it
+/// releases to the device.
+fn play(prebuffer: &mut Prebuffer, output: Option<&mut AlsaOutput>, pcm: Vec<i16>) {
+    if let Some(chunk) = prebuffer.push(&pcm) {
+        if let Some(out) = output {
+            out.write(&chunk);
+        }
+    }
 }
 
 /// Accumulates decoded PCM until a packet threshold is reached, then releases

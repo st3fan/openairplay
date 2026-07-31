@@ -1,6 +1,7 @@
 pub mod avahi;
 pub mod crypto;
 pub mod decode;
+pub mod jitter;
 pub mod mac;
 pub mod player;
 pub mod rtp;
@@ -8,6 +9,7 @@ pub mod rtsp;
 pub mod sdp;
 pub mod server;
 pub mod session;
+pub mod volume;
 
 /// Receiver-wide configuration, shared by the RTSP server and the mDNS
 /// advertisement. The MAC address must be the same in both places: clients
