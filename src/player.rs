@@ -1,28 +1,36 @@
 //! ALSA audio output.
 //!
 //! A dedicated OS thread owns the ALAC decoder and the blocking ALSA PCM
-//! handle; the async audio receiver hands it decrypted ALAC frames over a
-//! channel. Blocking `writei` calls pace playback to real time. This is the
-//! naive milestone-3 player: prebuffer a little, then stream in arrival
-//! order. No sequence reordering, retransmits, or clock sync yet.
+//! handle; the async audio receiver hands it decrypted ALAC frames (tagged
+//! with their RTP timestamp) over a channel. Once the clock model is ready
+//! the first frame is held until its `play_time`, giving a latency-correct
+//! start; otherwise a fixed prebuffer is used. Blocking `writei` calls pace
+//! playback, and the ALSA queue depth is nudged to counter clock drift.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use alsa::pcm::{Access, Format, HwParams, State, PCM};
 use alsa::{Direction, ValueOr};
 use log::{debug, info, warn};
 
+use crate::clock::{self, ClockModel};
 use crate::decode::AlacDecoder;
 use crate::sdp::AlacConfig;
 use crate::volume;
 
 enum Command {
-    Frame(Vec<u8>),
-    /// A lost packet: emit one packet of silence to keep timing aligned.
-    Silence,
+    Frame {
+        ts: u32,
+        packet: Vec<u8>,
+    },
+    /// A lost packet at this RTP timestamp: emit silence to keep timing.
+    Silence {
+        ts: u32,
+    },
     /// New linear gain in `[0.0, 1.0]`.
     Volume(f32),
     Flush,
@@ -37,14 +45,14 @@ pub struct PlayerSender {
 }
 
 impl PlayerSender {
-    /// Queue a decrypted ALAC frame for playback.
-    pub fn frame(&self, packet: Vec<u8>) {
-        let _ = self.tx.send(Command::Frame(packet));
+    /// Queue a decrypted ALAC frame (with its RTP timestamp) for playback.
+    pub fn frame(&self, ts: u32, packet: Vec<u8>) {
+        let _ = self.tx.send(Command::Frame { ts, packet });
     }
 
     /// Signal a lost packet so the player conceals it with silence.
-    pub fn silence(&self) {
-        let _ = self.tx.send(Command::Silence);
+    pub fn silence(&self, ts: u32) {
+        let _ = self.tx.send(Command::Silence { ts });
     }
 
     /// Drop buffered audio and re-arm the prebuffer (used on FLUSH).
@@ -67,7 +75,11 @@ impl Player {
     /// `--no-audio` and for hosts without working audio). Never fails: if the
     /// device can't be opened the thread logs and discards audio so the RTSP
     /// session keeps running.
-    pub fn spawn(config: &AlacConfig, device: Option<String>) -> Player {
+    pub fn spawn(
+        config: &AlacConfig,
+        device: Option<String>,
+        clock: Arc<Mutex<ClockModel>>,
+    ) -> Player {
         let config = *config;
         let prebuffer_packets = prebuffer_packets(&config);
         let (tx, rx) = std::sync::mpsc::channel();
@@ -75,7 +87,7 @@ impl Player {
         let thread_stop = stop.clone();
         let handle = std::thread::Builder::new()
             .name("alsa-player".into())
-            .spawn(move || run(config, device, prebuffer_packets, rx, thread_stop))
+            .spawn(move || run(config, device, prebuffer_packets, rx, thread_stop, clock))
             .expect("spawn player thread");
         Player {
             tx: Some(tx),
@@ -132,6 +144,7 @@ fn run(
     prebuffer_packets: usize,
     rx: Receiver<Command>,
     stop: Arc<AtomicBool>,
+    clock: Arc<Mutex<ClockModel>>,
 ) {
     let mut decoder = match AlacDecoder::new(&config) {
         Ok(d) => d,
@@ -163,9 +176,19 @@ fn run(
         }
     };
 
-    // One packet of silence, for concealing a lost packet.
-    let silence_frame = vec![0i16; config.frames_per_packet as usize * decoder.channels()];
-    let mut prebuffer = Prebuffer::new(prebuffer_packets);
+    let channels = decoder.channels();
+    let silence_frame = vec![0i16; config.frames_per_packet as usize * channels];
+    // Drift target: keep the ALSA queue near the prebuffered depth; only
+    // correct once it strays by more than ~10 ms.
+    let target_depth = (prebuffer_packets as i64) * config.frames_per_packet as i64;
+    let drift_threshold = config.sample_rate as i64 / 100;
+    let mut playout = Playout::new(
+        prebuffer_packets,
+        clock,
+        channels,
+        target_depth,
+        drift_threshold,
+    );
     let mut gain: f32 = 1.0;
     let mut decoded_packets: u64 = 0;
     while let Ok(command) = rx.recv() {
@@ -175,7 +198,7 @@ fn run(
             break;
         }
         match command {
-            Command::Frame(packet) => {
+            Command::Frame { ts, packet } => {
                 let pcm = match decoder.decode(&packet) {
                     Ok(pcm) => pcm,
                     Err(e) => {
@@ -189,17 +212,17 @@ fn run(
                 }
                 let mut pcm = pcm.to_vec();
                 volume::apply_gain(&mut pcm, gain);
-                play(&mut prebuffer, output.as_mut(), pcm);
+                playout.feed(ts, pcm, output.as_mut());
             }
-            Command::Silence => {
-                play(&mut prebuffer, output.as_mut(), silence_frame.clone());
+            Command::Silence { ts } => {
+                playout.feed(ts, silence_frame.clone(), output.as_mut());
             }
             Command::Volume(g) => {
                 debug!("player: gain {g:.4}");
                 gain = g;
             }
             Command::Flush => {
-                prebuffer.reset();
+                playout.reset();
                 if let Some(out) = output.as_mut() {
                     out.reset();
                 }
@@ -214,13 +237,130 @@ fn drain(rx: Receiver<Command>) {
     while rx.recv().is_ok() {}
 }
 
-/// Push one packet of PCM through the prebuffer and write whatever it
-/// releases to the device.
-fn play(prebuffer: &mut Prebuffer, output: Option<&mut AlsaOutput>, pcm: Vec<i16>) {
-    if let Some(chunk) = prebuffer.push(&pcm) {
+/// Drives the transition from prebuffering to steady playback: a
+/// latency-correct start off the clock model (falling back to a fixed
+/// prebuffer) and ALSA-queue-depth drift correction thereafter.
+struct Playout {
+    prebuffer: Prebuffer,
+    clock: Arc<Mutex<ClockModel>>,
+    channels: usize,
+    target_depth: i64,
+    drift_threshold: i64,
+    started: bool,
+    first_ts: Option<u32>,
+    since_drift_check: u32,
+}
+
+impl Playout {
+    fn new(
+        prebuffer_packets: usize,
+        clock: Arc<Mutex<ClockModel>>,
+        channels: usize,
+        target_depth: i64,
+        drift_threshold: i64,
+    ) -> Playout {
+        Playout {
+            prebuffer: Prebuffer::new(prebuffer_packets),
+            clock,
+            channels,
+            target_depth,
+            drift_threshold,
+            started: false,
+            first_ts: None,
+            since_drift_check: 0,
+        }
+    }
+
+    fn feed(&mut self, ts: u32, pcm: Vec<i16>, output: Option<&mut AlsaOutput>) {
+        if !self.started {
+            self.first_ts.get_or_insert(ts);
+        }
+        let Some(chunk) = self.prebuffer.push(&pcm) else {
+            return;
+        };
+        let starting = !self.started;
+        if starting {
+            self.started = true;
+            self.await_start_instant();
+        }
         if let Some(out) = output {
+            let chunk = if starting {
+                chunk
+            } else {
+                self.drift_correct(chunk, out)
+            };
             out.write(&chunk);
         }
+    }
+
+    /// Hold the first chunk until its frame's `play_time`, so audio starts at
+    /// the instant the client intends. No-op until the clock model is ready.
+    fn await_start_instant(&self) {
+        let Some(first_ts) = self.first_ts else {
+            return;
+        };
+        let target = self.clock.lock().unwrap().play_time(first_ts);
+        let Some(target) = target else {
+            info!("player: start via prebuffer (no clock sync yet)");
+            return;
+        };
+        let now = clock::now_ns();
+        if target > now {
+            let wait = (target - now).min(2_000_000_000); // cap the wait at 2 s
+            info!(
+                "player: latency-correct start, waiting {} ms",
+                wait / 1_000_000
+            );
+            std::thread::sleep(Duration::from_nanos(wait));
+        } else {
+            info!("player: latency-correct start (already due, no wait)");
+        }
+    }
+
+    /// Nudge the chunk by ±1 frame to steer the ALSA queue depth back toward
+    /// the target, countering source/DAC clock drift. Checked periodically.
+    fn drift_correct(&mut self, mut chunk: Vec<i16>, out: &AlsaOutput) -> Vec<i16> {
+        self.since_drift_check += 1;
+        if self.since_drift_check < 50 {
+            return chunk;
+        }
+        self.since_drift_check = 0;
+        let Some(depth) = out.delay() else {
+            return chunk;
+        };
+        match drift_action(depth, self.target_depth, self.drift_threshold) {
+            1 if chunk.len() >= self.channels => {
+                // Queue too shallow: duplicate the last frame to add depth.
+                let tail = chunk[chunk.len() - self.channels..].to_vec();
+                chunk.extend_from_slice(&tail);
+            }
+            -1 if chunk.len() >= self.channels => {
+                // Queue too deep: drop one frame.
+                chunk.truncate(chunk.len() - self.channels);
+            }
+            _ => {}
+        }
+        chunk
+    }
+
+    fn reset(&mut self) {
+        self.prebuffer.reset();
+        self.started = false;
+        self.first_ts = None;
+        self.since_drift_check = 0;
+    }
+}
+
+/// Drift correction decision from the current ALSA queue depth: `+1` insert a
+/// frame (too shallow, risking underrun), `-1` drop a frame (too deep), `0`
+/// hold.
+fn drift_action(depth: i64, target: i64, threshold: i64) -> i32 {
+    if depth < target - threshold {
+        1
+    } else if depth > target + threshold {
+        -1
+    } else {
+        0
     }
 }
 
@@ -313,6 +453,12 @@ impl AlsaOutput {
         }
     }
 
+    /// Frames currently queued in the device (how far ahead of the DAC we
+    /// are), for drift correction. `None` if ALSA can't report it.
+    fn delay(&self) -> Option<i64> {
+        self.pcm.delay().ok()
+    }
+
     /// Reset the device after a flush so the next write starts cleanly.
     fn reset(&mut self) {
         if self.pcm.state() == State::Running {
@@ -358,5 +504,32 @@ mod tests {
         let config = AlacConfig::parse("96 352 0 16 40 10 14 2 255 0 0 44100").unwrap();
         // 200 ms = 8820 frames / 352 per packet = 25 packets.
         assert_eq!(prebuffer_packets(&config), 25);
+    }
+
+    #[test]
+    fn drift_action_steers_toward_target() {
+        let target = 8820;
+        let thr = 441; // 10 ms at 44100
+        assert_eq!(drift_action(target, target, thr), 0, "on target: hold");
+        assert_eq!(
+            drift_action(target + 100, target, thr),
+            0,
+            "within band: hold"
+        );
+        assert_eq!(
+            drift_action(target - 100, target, thr),
+            0,
+            "within band: hold"
+        );
+        assert_eq!(
+            drift_action(target - 500, target, thr),
+            1,
+            "too shallow: insert"
+        );
+        assert_eq!(
+            drift_action(target + 500, target, thr),
+            -1,
+            "too deep: drop"
+        );
     }
 }

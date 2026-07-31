@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
@@ -15,6 +15,7 @@ use log::{debug, info, warn};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
+use crate::clock::{self, ClockModel};
 use crate::crypto;
 use crate::jitter::{Delivery, JitterBuffer};
 use crate::player::{Player, PlayerSender};
@@ -220,16 +221,22 @@ impl Session {
             self.local_audio_port, self.local_control_port, self.local_timing_port
         );
 
+        // Shared clock model, updated by the timing exchange (offset) and the
+        // sync packets (anchor), read by the player for latency-correct start.
+        let clock = Arc::new(Mutex::new(ClockModel::new(params.alac.sample_rate)));
+
         // Spawn the ALSA player (decode-only if no device / open fails) and
         // hand the receiver a sender so decrypted frames reach playback.
-        let player = Player::spawn(&params.alac, self.audio_device.clone());
+        let player = Player::spawn(&params.alac, self.audio_device.clone(), clock.clone());
         let player_sender = player.sender();
         self.player = Some(player);
 
         // Share the control socket: the audio task sends resend requests on it
         // while the control task reads sync packets.
         let control = Arc::new(control);
+        let timing = Arc::new(timing);
         let client_control = SocketAddr::new(self.peer_ip, control_port);
+        let client_timing = SocketAddr::new(self.peer_ip, timing_port);
         let (flush_tx, flush_rx) = tokio::sync::mpsc::unbounded_channel();
         self.flush_tx = Some(flush_tx);
         self.tasks.push(tokio::spawn(audio_receiver(
@@ -241,8 +248,10 @@ impl Session {
             client_control,
             flush_rx,
         )));
-        self.tasks.push(tokio::spawn(control_receiver(control)));
-        self.tasks.push(tokio::spawn(timing_receiver(timing)));
+        self.tasks
+            .push(tokio::spawn(control_receiver(control, clock.clone())));
+        self.tasks
+            .push(tokio::spawn(timing_task(timing, client_timing, clock)));
 
         let transport = format!(
             "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port={};timing_port={};server_port={}",
@@ -469,27 +478,16 @@ fn drain_deliveries(
     for delivery in jitter.pop_ready() {
         match delivery {
             Delivery::Packet { seq, frame } => {
+                let ts = derive_ts(seq, anchor, frames_per_packet);
                 let looks_like_alac = rtp::looks_like_alac_stereo(&frame);
                 match (player, observer) {
                     (Some(player), Some(observer)) => {
-                        player.frame(frame.clone());
-                        let _ = observer.send(decrypted(
-                            seq,
-                            frame,
-                            looks_like_alac,
-                            anchor,
-                            frames_per_packet,
-                        ));
+                        player.frame(ts, frame.clone());
+                        let _ = observer.send(decrypted(seq, ts, frame, looks_like_alac));
                     }
-                    (Some(player), None) => player.frame(frame),
+                    (Some(player), None) => player.frame(ts, frame),
                     (None, Some(observer)) => {
-                        let _ = observer.send(decrypted(
-                            seq,
-                            frame,
-                            looks_like_alac,
-                            anchor,
-                            frames_per_packet,
-                        ));
+                        let _ = observer.send(decrypted(seq, ts, frame, looks_like_alac));
                     }
                     (None, None) => {}
                 }
@@ -497,25 +495,23 @@ fn drain_deliveries(
             Delivery::Lost { seq } => {
                 debug!("audio: concealing lost packet seq={seq}");
                 if let Some(player) = player {
-                    player.silence();
+                    player.silence(derive_ts(seq, anchor, frames_per_packet));
                 }
             }
         }
     }
 }
 
-fn decrypted(
-    seq: u16,
-    frame: Vec<u8>,
-    looks_like_alac: bool,
-    anchor: Option<(u16, u32)>,
-    frames_per_packet: u32,
-) -> DecryptedAudio {
-    // RAOP timestamps advance by frames_per_packet per sequence number.
-    let timestamp = anchor.map_or(0, |(a_seq, a_ts)| {
+/// The RTP timestamp for a delivered sequence number: RAOP timestamps advance
+/// by `frames_per_packet` per sequence number from the first packet's anchor.
+fn derive_ts(seq: u16, anchor: Option<(u16, u32)>, frames_per_packet: u32) -> u32 {
+    anchor.map_or(0, |(a_seq, a_ts)| {
         let ahead = crate::jitter::seq_diff(seq, a_seq).max(0) as u32;
         a_ts.wrapping_add(ahead.wrapping_mul(frames_per_packet))
-    });
+    })
+}
+
+fn decrypted(seq: u16, timestamp: u32, frame: Vec<u8>, looks_like_alac: bool) -> DecryptedAudio {
     DecryptedAudio {
         sequence: seq,
         timestamp,
@@ -543,19 +539,66 @@ async fn request_resends(
     }
 }
 
-async fn control_receiver(socket: Arc<UdpSocket>) {
+/// Read the control channel: parse `0xd4` sync packets and update the clock
+/// model's anchor (the frame at the DAC at a given client-clock instant).
+async fn control_receiver(socket: Arc<UdpSocket>, clock: Arc<Mutex<ClockModel>>) {
     let mut buf = [0u8; 2048];
     while let Ok(n) = socket.recv(&mut buf).await {
-        if let Some(kind) = rtp::classify_control(&buf[..n]) {
+        if let Some(sync) = rtp::parse_sync(&buf[..n]) {
+            clock
+                .lock()
+                .unwrap()
+                .set_anchor(sync.remote_time_ns, sync.rtp_at_dac);
+        } else if let Some(kind) = rtp::classify_control(&buf[..n]) {
             debug!("control: {kind:?} ({n} bytes)");
         }
     }
 }
 
-async fn timing_receiver(socket: UdpSocket) {
+/// The NTP timing exchange: periodically send a `0xd2` request to the client's
+/// timing port and fold each `0xd3` reply into the clock model's offset. An
+/// initial fast burst converges quickly, then it settles to ~every 3 s.
+async fn timing_task(
+    socket: Arc<UdpSocket>,
+    client_timing: SocketAddr,
+    clock: Arc<Mutex<ClockModel>>,
+) {
     let mut buf = [0u8; 2048];
-    while let Ok(n) = socket.recv(&mut buf).await {
-        debug!("timing: {n} bytes");
+    let mut request_count: u64 = 0;
+
+    loop {
+        // Send a timing request and record when it left (t1).
+        let departure_ns = clock::now_ns();
+        if let Err(e) = socket.send_to(&rtp::timing_request(), client_timing).await {
+            debug!("timing: request send failed: {e}");
+        }
+        request_count += 1;
+        let interval = if request_count <= 3 {
+            Duration::from_millis(300)
+        } else {
+            Duration::from_secs(3)
+        };
+
+        // Collect replies until it's time to send the next request.
+        let deadline = tokio::time::sleep(interval);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                result = socket.recv(&mut buf) => {
+                    let Ok(n) = result else { return };
+                    let arrival_ns = clock::now_ns();
+                    if let Some(reply) = rtp::parse_timing_reply(&buf[..n]) {
+                        clock.lock().unwrap().add_timing(
+                            departure_ns,
+                            reply.receive_ns,
+                            reply.transmit_ns,
+                            arrival_ns,
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
