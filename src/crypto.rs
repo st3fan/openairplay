@@ -1,0 +1,177 @@
+//! The AirPort Express RSA key and the Apple-Challenge/Apple-Response
+//! computation.
+//!
+//! The private key was extracted from an AirPort Express by James Laird and
+//! is shipped by every third-party AirPlay 1 receiver (this copy is taken
+//! verbatim from shairport-sync's `common.c`). Clients prove they are
+//! talking to a "real" AirPort by sending 16 random bytes in an
+//! `Apple-Challenge` header; we must sign challenge+address material with
+//! this key and return it in `Apple-Response`.
+
+use std::fmt;
+use std::net::IpAddr;
+use std::sync::OnceLock;
+
+use base64::engine::general_purpose::STANDARD_NO_PAD;
+use base64::Engine;
+use rsa::pkcs1::DecodeRsaPrivateKey;
+use rsa::{Pkcs1v15Sign, RsaPrivateKey};
+
+pub const AIRPORT_PRIVATE_KEY_PEM: &str = include_str!("airport.pem");
+
+pub fn airport_private_key() -> &'static RsaPrivateKey {
+    static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
+    KEY.get_or_init(|| {
+        RsaPrivateKey::from_pkcs1_pem(AIRPORT_PRIVATE_KEY_PEM)
+            .expect("embedded AirPort RSA key must parse")
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChallengeError {
+    InvalidBase64,
+    Oversized(usize),
+}
+
+impl fmt::Display for ChallengeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChallengeError::InvalidBase64 => write!(f, "Apple-Challenge is not valid base64"),
+            ChallengeError::Oversized(n) => {
+                write!(f, "Apple-Challenge decodes to {n} bytes (max 16)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChallengeError {}
+
+/// Compute the `Apple-Response` value for an `Apple-Challenge`.
+///
+/// The signed message is: challenge bytes (≤16) ‖ the IP address the client
+/// connected to (4 bytes for IPv4, 16 for IPv6, with v4-mapped IPv6
+/// contributing its 4 IPv4 bytes) ‖ our 6-byte MAC address, zero-padded to
+/// at least 32 bytes. The signature is raw PKCS#1 v1.5 (no digest) with the
+/// AirPort key, base64-encoded without padding.
+pub fn apple_response(
+    challenge_b64: &str,
+    local_ip: IpAddr,
+    mac: &[u8; 6],
+) -> Result<String, ChallengeError> {
+    // Clients send the challenge with or without base64 '=' padding.
+    let challenge = STANDARD_NO_PAD
+        .decode(challenge_b64.trim().trim_end_matches('='))
+        .map_err(|_| ChallengeError::InvalidBase64)?;
+    if challenge.len() > 16 {
+        return Err(ChallengeError::Oversized(challenge.len()));
+    }
+
+    let mut buf = Vec::with_capacity(48);
+    buf.extend_from_slice(&challenge);
+    match local_ip {
+        IpAddr::V4(a) => buf.extend_from_slice(&a.octets()),
+        IpAddr::V6(a) => match a.to_ipv4_mapped() {
+            Some(v4) => buf.extend_from_slice(&v4.octets()),
+            None => buf.extend_from_slice(&a.octets()),
+        },
+    }
+    buf.extend_from_slice(mac);
+    if buf.len() < 32 {
+        buf.resize(32, 0);
+    }
+
+    let signature = airport_private_key()
+        .sign(Pkcs1v15Sign::new_unprefixed(), &buf)
+        .expect("RSA signing of a 32..48 byte message cannot fail");
+    Ok(STANDARD_NO_PAD.encode(signature))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose::STANDARD;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    const MAC: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+
+    fn verify(challenge: &[u8], ip_bytes: &[u8], response_b64: &str) {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(challenge);
+        buf.extend_from_slice(ip_bytes);
+        buf.extend_from_slice(&MAC);
+        if buf.len() < 32 {
+            buf.resize(32, 0);
+        }
+        let signature = STANDARD_NO_PAD.decode(response_b64).unwrap();
+        airport_private_key()
+            .to_public_key()
+            .verify(Pkcs1v15Sign::new_unprefixed(), &buf, &signature)
+            .expect("Apple-Response signature must verify");
+    }
+
+    #[test]
+    fn signs_ipv4_challenge() {
+        let challenge = [7u8; 16];
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        let resp = apple_response(&STANDARD.encode(challenge), ip, &MAC).unwrap();
+        assert!(
+            !resp.contains('='),
+            "response must not carry base64 padding"
+        );
+        verify(&challenge, &[192, 168, 1, 10], &resp);
+    }
+
+    #[test]
+    fn accepts_unpadded_challenge() {
+        let challenge = [1u8; 16];
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let padded = STANDARD.encode(challenge);
+        let unpadded = padded.trim_end_matches('=').to_string();
+        assert_eq!(
+            apple_response(&padded, ip, &MAC).unwrap(),
+            apple_response(&unpadded, ip, &MAC).unwrap()
+        );
+    }
+
+    #[test]
+    fn short_challenge_is_zero_padded_to_32() {
+        let challenge = [9u8; 4];
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let resp = apple_response(&STANDARD.encode(challenge), ip, &MAC).unwrap();
+        verify(&challenge, &[10, 0, 0, 1], &resp);
+    }
+
+    #[test]
+    fn v4_mapped_ipv6_uses_ipv4_bytes() {
+        let challenge = [3u8; 16];
+        let mapped = IpAddr::V6(Ipv4Addr::new(172, 16, 0, 2).to_ipv6_mapped());
+        let plain = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 2));
+        let b64 = STANDARD.encode(challenge);
+        assert_eq!(
+            apple_response(&b64, mapped, &MAC).unwrap(),
+            apple_response(&b64, plain, &MAC).unwrap()
+        );
+    }
+
+    #[test]
+    fn real_ipv6_uses_all_16_bytes() {
+        let challenge = [5u8; 16];
+        let ip6 = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x1234, 0x5678, 0x9abc, 0xdef0);
+        let resp = apple_response(&STANDARD.encode(challenge), IpAddr::V6(ip6), &MAC).unwrap();
+        verify(&challenge, &ip6.octets(), &resp);
+    }
+
+    #[test]
+    fn rejects_oversized_challenge() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let err = apple_response(&STANDARD.encode([0u8; 17]), ip, &MAC).unwrap_err();
+        assert_eq!(err, ChallengeError::Oversized(17));
+    }
+
+    #[test]
+    fn rejects_bad_base64() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let err = apple_response("!!!not-base64!!!", ip, &MAC).unwrap_err();
+        assert_eq!(err, ChallengeError::InvalidBase64);
+    }
+}
