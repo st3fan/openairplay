@@ -37,6 +37,7 @@ async fn start() -> (
         name: "Test".to_string(),
         port: addr.port(),
         mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        alsa_device: None, // decode-only; tests never touch hardware
     });
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(server::serve_with_observer(listener, config, Some(tx)));

@@ -1,6 +1,8 @@
 pub mod avahi;
 pub mod crypto;
+pub mod decode;
 pub mod mac;
+pub mod player;
 pub mod rtp;
 pub mod rtsp;
 pub mod sdp;
@@ -16,6 +18,9 @@ pub struct Config {
     pub name: String,
     pub port: u16,
     pub mac: [u8; 6],
+    /// ALSA device to play to (e.g. `default`), or `None` to run decode-only
+    /// (`--no-audio`).
+    pub alsa_device: Option<String>,
 }
 
 impl Config {

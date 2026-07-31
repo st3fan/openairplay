@@ -17,15 +17,24 @@ signature, and advertises `_raop._tcp` via Avahi.
 **Milestone 2 (handshake & decryption) — complete.** Handles
 ANNOUNCE / SETUP / RECORD: parses the SDP, RSA-OAEP-decrypts the AES session
 key, binds the three UDP channels, and receives, AES-CBC-decrypts, and
-sanity-checks the incoming audio packets. ALAC decode and ALSA output are not
-yet implemented (milestone 3), so no sound comes out yet; methods with no
-handler still return `501 Not Implemented`.
+sanity-checks the incoming audio packets.
+
+**Milestone 3 (sound) — complete.** Decodes the ALAC frames and plays them to
+an ALSA device: naive playback (small prebuffer, arrival order, no jitter
+buffer or clock sync yet). Verified end-to-end on real hardware — the
+played-out PCM matches the source audio byte-for-byte. Use `--alsa-device` to
+pick the output (default `default`) or `--no-audio` for decode-only.
+Sequence-ordered buffering + retransmits (milestone 4) and timing/clock sync
+(milestone 5) are still to come.
 
 ## Build & test
 
+Building links against ALSA, so the development headers are required
+(Debian/Ubuntu: `libasound2-dev`).
+
 ```sh
 cargo build
-cargo test
+cargo test   # no audio hardware needed; tests never open ALSA
 ```
 
 ## Run
@@ -35,11 +44,13 @@ cargo test
 ./target/debug/openairplay --name "Living Room"
 
 # Options
-#   --name NAME     friendly name shown on the client (default OpenAirPlay)
-#   --port PORT     RTSP TCP port (default 5000)
-#   --mac AA:..:FF  MAC used in the service name and challenge signature
-#                   (default: auto-detected from /sys/class/net)
-#   --no-avahi      do not spawn avahi-publish-service
+#   --name NAME        friendly name shown on the client (default OpenAirPlay)
+#   --port PORT        RTSP TCP port (default 5000)
+#   --mac AA:..:FF     MAC used in the service name and challenge signature
+#                      (default: auto-detected from /sys/class/net)
+#   --alsa-device DEV  ALSA output device (default "default")
+#   --no-audio         decode only, don't open an audio device
+#   --no-avahi         do not spawn avahi-publish-service
 
 # Verbose logging:
 RUST_LOG=debug ./target/debug/openairplay

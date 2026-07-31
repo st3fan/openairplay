@@ -12,6 +12,7 @@ use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
 use crate::crypto;
+use crate::player::{Player, PlayerSender};
 use crate::rtp::{self, AudioPacket};
 use crate::rtsp::{Request, Response};
 use crate::sdp::{AlacConfig, Sdp};
@@ -35,8 +36,6 @@ struct StreamParams {
     encrypted: bool,
     key: [u8; 16],
     iv: [u8; 16],
-    // Captured now; consumed by the ALAC decoder in milestone 3.
-    #[allow(dead_code)]
     alac: AlacConfig,
 }
 
@@ -44,6 +43,9 @@ pub struct Session {
     params: Option<StreamParams>,
     tasks: Vec<JoinHandle<()>>,
     observer: Option<AudioObserver>,
+    /// ALSA device to play to, or `None` for decode-only (`--no-audio`).
+    audio_device: Option<String>,
+    player: Option<Player>,
     /// Local UDP ports handed to the client in the SETUP response.
     local_audio_port: u16,
     local_control_port: u16,
@@ -51,9 +53,11 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(observer: Option<AudioObserver>) -> Self {
+    pub fn new(observer: Option<AudioObserver>, audio_device: Option<String>) -> Self {
         Session {
             observer,
+            audio_device,
+            player: None,
             params: None,
             tasks: Vec::new(),
             local_audio_port: 0,
@@ -151,10 +155,17 @@ impl Session {
             self.local_audio_port, self.local_control_port, self.local_timing_port
         );
 
+        // Spawn the ALSA player (decode-only if no device / open fails) and
+        // hand the receiver a sender so decrypted frames reach playback.
+        let player = Player::spawn(&params.alac, self.audio_device.clone());
+        let player_sender = player.sender();
+        self.player = Some(player);
+
         self.tasks.push(tokio::spawn(audio_receiver(
             audio,
             params,
             self.observer.clone(),
+            Some(player_sender),
         )));
         self.tasks.push(tokio::spawn(control_receiver(control)));
         self.tasks.push(tokio::spawn(timing_receiver(timing)));
@@ -187,10 +198,16 @@ impl Session {
         match request.method.as_str() {
             "TEARDOWN" => {
                 self.stop_tasks();
+                self.player = None;
                 info!("TEARDOWN: session closed");
                 Some(Response::ok())
             }
-            "FLUSH" => Some(Response::ok()),
+            "FLUSH" => {
+                if let Some(player) = &self.player {
+                    player.flush();
+                }
+                Some(Response::ok())
+            }
             "SET_PARAMETER" => {
                 let body = String::from_utf8_lossy(&request.body);
                 for line in body.lines() {
@@ -250,8 +267,17 @@ async fn bind_three(ip: IpAddr) -> io::Result<(UdpSocket, UdpSocket, UdpSocket)>
     Ok((bind(ip).await?, bind(ip).await?, bind(ip).await?))
 }
 
-async fn audio_receiver(socket: UdpSocket, params: StreamParams, observer: Option<AudioObserver>) {
-    let mut buf = [0u8; 2048];
+async fn audio_receiver(
+    socket: UdpSocket,
+    params: StreamParams,
+    observer: Option<AudioObserver>,
+    player: Option<PlayerSender>,
+) {
+    // Real RAOP uses 352-frame packets (~1.4 KiB), but the announced frame
+    // length can be larger; 16 KiB holds a 4096-frame 16-bit stereo packet
+    // and then some. Too-small a buffer silently truncates the datagram and
+    // the payload fails to decode.
+    let mut buf = vec![0u8; 16 * 1024];
     let mut received: u64 = 0;
     let mut decrypt_ok: u64 = 0;
     loop {
@@ -287,13 +313,28 @@ async fn audio_receiver(socket: UdpSocket, params: StreamParams, observer: Optio
             );
         }
 
-        if let Some(observer) = &observer {
-            let _ = observer.send(DecryptedAudio {
-                sequence: packet.sequence,
-                timestamp: packet.timestamp,
-                looks_like_alac,
-                frame,
-            });
+        // Forward to playback and/or the test observer. Only clone when both
+        // want the bytes; the production path (player only) moves them.
+        match (&player, &observer) {
+            (Some(player), Some(observer)) => {
+                player.frame(frame.clone());
+                let _ = observer.send(DecryptedAudio {
+                    sequence: packet.sequence,
+                    timestamp: packet.timestamp,
+                    looks_like_alac,
+                    frame,
+                });
+            }
+            (Some(player), None) => player.frame(frame),
+            (None, Some(observer)) => {
+                let _ = observer.send(DecryptedAudio {
+                    sequence: packet.sequence,
+                    timestamp: packet.timestamp,
+                    looks_like_alac,
+                    frame,
+                });
+            }
+            (None, None) => {}
         }
     }
 }

@@ -9,6 +9,7 @@ use openairplay::{avahi, mac, server, Config};
 
 const DEFAULT_NAME: &str = "OpenAirPlay";
 const DEFAULT_PORT: u16 = 5000;
+const DEFAULT_ALSA_DEVICE: &str = "default";
 // Locally-administered fallback for hosts where /sys/class/net yields
 // nothing usable; discovery/auth still work, the address just isn't real.
 const FALLBACK_MAC: [u8; 6] = [0x02, 0x4f, 0x41, 0x50, 0x31, 0x00];
@@ -18,11 +19,13 @@ struct Args {
     port: u16,
     mac: Option<[u8; 6]>,
     avahi: bool,
+    alsa_device: Option<String>,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: openairplay [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] [--no-avahi]"
+        "usage: openairplay [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
+         [--alsa-device DEV] [--no-audio] [--no-avahi]"
     );
     std::process::exit(2);
 }
@@ -33,6 +36,7 @@ fn parse_args() -> Args {
         port: DEFAULT_PORT,
         mac: None,
         avahi: true,
+        alsa_device: Some(DEFAULT_ALSA_DEVICE.to_string()),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -52,6 +56,8 @@ fn parse_args() -> Args {
                         .unwrap_or_else(|| usage()),
                 )
             }
+            "--alsa-device" => args.alsa_device = Some(it.next().unwrap_or_else(|| usage())),
+            "--no-audio" => args.alsa_device = None,
             "--no-avahi" => args.avahi = false,
             "-h" | "--help" => usage(),
             other => {
@@ -76,12 +82,14 @@ async fn main() -> ExitCode {
         name: args.name,
         port: args.port,
         mac,
+        alsa_device: args.alsa_device,
     });
     info!(
-        "starting receiver \"{}\" (mac {}, rtsp port {})",
+        "starting receiver \"{}\" (mac {}, rtsp port {}, audio {})",
         config.name,
         config.mac_hex(),
-        config.port
+        config.port,
+        config.alsa_device.as_deref().unwrap_or("disabled")
     );
 
     // Prefer a dual-stack socket (IPv4 clients arrive as v4-mapped

@@ -56,7 +56,7 @@ async fn handle_connection(
     let local_addr = stream.local_addr()?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    let mut session = Session::new(observer);
+    let mut session = Session::new(observer, config.alsa_device.clone());
 
     while let Some(request) = read_request(&mut reader).await? {
         log_request(&peer, &request);
