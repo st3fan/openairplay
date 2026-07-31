@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::{Pkcs1v15Sign, RsaPrivateKey};
+use rsa::{Oaep, Pkcs1v15Sign, RsaPrivateKey};
 
 pub const AIRPORT_PRIVATE_KEY_PEM: &str = include_str!("airport.pem");
 
@@ -85,6 +85,38 @@ pub fn apple_response(
         .expect("RSA signing of a 32..48 byte message cannot fail");
     Ok(STANDARD_NO_PAD.encode(signature))
 }
+
+/// Decrypt the AES session key from a SDP `a=rsaaeskey` value.
+///
+/// The client RSA-OAEP-encrypts a 16-byte AES key with the AirPort *public*
+/// key; we recover it with the private key. OAEP uses SHA-1 for both the
+/// hash and MGF1, matching shairport-sync's `RSA_MODE_KEY`.
+pub fn decrypt_aes_key(ciphertext: &[u8]) -> Result<[u8; 16], KeyError> {
+    let plaintext = airport_private_key()
+        .decrypt(Oaep::new::<sha1::Sha1>(), ciphertext)
+        .map_err(|_| KeyError::Decrypt)?;
+    plaintext
+        .as_slice()
+        .try_into()
+        .map_err(|_| KeyError::WrongLength(plaintext.len()))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeyError {
+    Decrypt,
+    WrongLength(usize),
+}
+
+impl fmt::Display for KeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            KeyError::Decrypt => write!(f, "rsaaeskey failed RSA-OAEP decryption"),
+            KeyError::WrongLength(n) => write!(f, "decrypted AES key is {n} bytes, wanted 16"),
+        }
+    }
+}
+
+impl std::error::Error for KeyError {}
 
 #[cfg(test)]
 mod tests {
@@ -173,5 +205,27 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let err = apple_response("!!!not-base64!!!", ip, &MAC).unwrap_err();
         assert_eq!(err, ChallengeError::InvalidBase64);
+    }
+
+    #[test]
+    fn decrypts_oaep_wrapped_aes_key() {
+        let key: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        // A real client encrypts with the AirPort *public* key; do the same.
+        let public = airport_private_key().to_public_key();
+        let mut rng = rand::thread_rng();
+        let ciphertext = public
+            .encrypt(&mut rng, Oaep::new::<sha1::Sha1>(), &key)
+            .unwrap();
+        assert_eq!(decrypt_aes_key(&ciphertext).unwrap(), key);
+    }
+
+    #[test]
+    fn rejects_garbage_key_ciphertext() {
+        // Random bytes of the right RSA size decrypt-fail under OAEP.
+        let bogus = vec![0x42u8; 256];
+        assert_eq!(decrypt_aes_key(&bogus).unwrap_err(), KeyError::Decrypt);
     }
 }

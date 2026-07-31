@@ -10,11 +10,16 @@ See [`notes/design.md`](notes/design.md) for the protocol design and
 
 ## Status
 
-**Milestone 1 (skeleton) — complete.** The receiver runs an RTSP server that
-logs requests, answers `OPTIONS` including the `Apple-Challenge` →
-`Apple-Response` RSA signature, and advertises `_raop._tcp` via Avahi. Audio
-handling (ANNOUNCE/SETUP/RECORD, decryption, ALAC, ALSA) is not yet
-implemented — other methods return `501 Not Implemented`.
+**Milestone 1 (skeleton) — complete.** RTSP server that logs requests,
+answers `OPTIONS` including the `Apple-Challenge` → `Apple-Response` RSA
+signature, and advertises `_raop._tcp` via Avahi.
+
+**Milestone 2 (handshake & decryption) — complete.** Handles
+ANNOUNCE / SETUP / RECORD: parses the SDP, RSA-OAEP-decrypts the AES session
+key, binds the three UDP channels, and receives, AES-CBC-decrypts, and
+sanity-checks the incoming audio packets. ALAC decode and ALSA output are not
+yet implemented (milestone 3), so no sound comes out yet; methods with no
+handler still return `501 Not Implemented`.
 
 ## Build & test
 

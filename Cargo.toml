@@ -6,8 +6,14 @@ description = "AirPlay 1 (RAOP) receiver for Linux/ALSA"
 license = "MIT"
 
 [dependencies]
+aes = "0.8"
 base64 = "0.22"
+cbc = "0.1"
 env_logger = "0.11"
 log = "0.4"
 rsa = "0.9"
+sha1 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
+
+[dev-dependencies]
+rand = "0.8"

@@ -114,9 +114,9 @@ async fn multiple_requests_per_connection_and_501_for_unimplemented() {
     assert_eq!(status, "RTSP/1.0 200 OK");
     assert_eq!(header(&headers, "CSeq"), Some("1"));
 
-    let announce = "ANNOUNCE rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 2\r\n\
-                    Content-Type: application/sdp\r\nContent-Length: 4\r\n\r\nv=0\n";
-    let (status, headers) = roundtrip(&mut stream, announce).await;
+    // PAUSE is advertised but not implemented; it must still 501 cleanly.
+    let pause = "PAUSE rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 2\r\n\r\n";
+    let (status, headers) = roundtrip(&mut stream, pause).await;
     assert_eq!(status, "RTSP/1.0 501 Not Implemented");
     assert_eq!(header(&headers, "CSeq"), Some("2"));
 
