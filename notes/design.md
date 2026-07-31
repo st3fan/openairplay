@@ -152,11 +152,17 @@ UDP audio ──> decrypt (AES-CBC) ──> jitter buffer (keyed by seq, u16 wra
 ## Avahi registration
 
 Register `_raop._tcp` with service name `<MAC>@<FriendlyName>` (MAC as 12 hex
-digits, e.g. `AABBCCDDEEFF@Living Room`). Two options:
+digits, e.g. `AABBCCDDEEFF@Living Room`). Two options were considered:
 
-1. Shell out to `avahi-publish-service` (dead simple, fine for v1).
+1. Shell out to `avahi-publish-service` (dead simple, but needs `avahi-utils`).
 2. Talk to the Avahi daemon over D-Bus with the `zbus` crate (proper
-   lifecycle, no subprocess).
+   lifecycle, no subprocess, no `avahi-utils` dependency).
+
+**Implemented: option 2.** `avahi.rs` connects to the system bus, calls
+`Server.EntryGroupNew` → `EntryGroup.AddService` → `Commit`, and holds the
+connection for the receiver's lifetime so the service is withdrawn on exit.
+Verified: an iPhone/Mac browsing `_raop._tcp` resolves the service (host,
+port, and TXT records) through the running `avahi-daemon`.
 
 TXT records (shairport-compatible):
 

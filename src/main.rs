@@ -110,10 +110,10 @@ async fn main() -> ExitCode {
     };
 
     let _advertisement = if args.avahi {
-        match avahi::publish(&config) {
+        match avahi::publish(&config).await {
             Ok(ad) => Some(ad),
             Err(e) => {
-                warn!("avahi advertisement disabled ({e}); is avahi-utils installed?");
+                warn!("avahi advertisement disabled ({e}); is avahi-daemon running?");
                 None
             }
         }
