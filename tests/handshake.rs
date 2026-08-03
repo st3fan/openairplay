@@ -15,10 +15,20 @@ use rsa::{Oaep, RsaPrivateKey};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
+use openairplay::server::{self, Context};
 use openairplay::session::DecryptedAudio;
-use openairplay::{crypto, server, Config};
+use openairplay::sink::AudioSink;
+use openairplay::{crypto, Config};
 
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
+
+/// Tests never touch audio hardware: the sink discards everything.
+struct Discard;
+
+impl AudioSink for Discard {
+    fn write(&mut self, _pcm: &[i16]) {}
+    fn flush(&mut self) {}
+}
 
 const KEY: [u8; 16] = [
     0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x07, 0x18, 0x29, 0x3a, 0x4b, 0x5c, 0x6d, 0x7e, 0x8f, 0x90,
@@ -33,14 +43,19 @@ async fn start() -> (
 ) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = Arc::new(Config {
+    let config = Config {
         name: "Test".to_string(),
         port: addr.port(),
         mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
-        alsa_device: None, // decode-only; tests never touch hardware
-    });
+    };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(server::serve_with_observer(listener, config, Some(tx)));
+    let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let context = Arc::new(Context {
+        config,
+        sink_factory: Arc::new(|_rate, _channels| Box::new(Discard)),
+        events,
+    });
+    tokio::spawn(server::serve_with_observer(listener, context, Some(tx)));
     (addr, rx)
 }
 

@@ -1,7 +1,9 @@
+pub mod alsa_sink;
 pub mod avahi;
 pub mod clock;
 pub mod crypto;
 pub mod decode;
+pub mod events;
 pub mod jitter;
 pub mod mac;
 pub mod player;
@@ -10,7 +12,7 @@ pub mod rtsp;
 pub mod sdp;
 pub mod server;
 pub mod session;
-pub mod volume;
+pub mod sink;
 
 /// Receiver-wide configuration, shared by the RTSP server and the mDNS
 /// advertisement. The MAC address must be the same in both places: clients
@@ -21,9 +23,6 @@ pub struct Config {
     pub name: String,
     pub port: u16,
     pub mac: [u8; 6],
-    /// ALSA device to play to (e.g. `default`), or `None` to run decode-only
-    /// (`--no-audio`).
-    pub alsa_device: Option<String>,
 }
 
 impl Config {

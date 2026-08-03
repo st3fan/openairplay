@@ -2,10 +2,14 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use log::{info, warn};
+use log::{debug, info, warn};
 use tokio::net::TcpListener;
 
-use openairplay::{avahi, mac, server, Config};
+use openairplay::alsa_sink::{volume_to_gain, AlsaSink, NullSink, SharedGain};
+use openairplay::events::Event;
+use openairplay::server::{self, Context};
+use openairplay::sink::AudioSink;
+use openairplay::{avahi, mac, Config};
 
 const DEFAULT_NAME: &str = "OpenAirPlay";
 const DEFAULT_PORT: u16 = 5000;
@@ -78,19 +82,21 @@ async fn main() -> ExitCode {
         warn!("no network interface MAC found, using a fixed fallback");
         FALLBACK_MAC
     });
-    let config = Arc::new(Config {
+    let config = Config {
         name: args.name,
         port: args.port,
         mac,
-        alsa_device: args.alsa_device,
-    });
+    };
     info!(
-        "starting receiver \"{}\" (mac {}, rtsp port {}, audio {})",
+        "starting receiver \"{}\" (mac {}, rtsp port {})",
         config.name,
         config.mac_hex(),
-        config.port,
-        config.alsa_device.as_deref().unwrap_or("disabled")
+        config.port
     );
+    match &args.alsa_device {
+        Some(dev) => info!("audio output: ALSA \"{dev}\""),
+        None => info!("audio output: disabled (--no-audio)"),
+    }
 
     // Prefer a dual-stack socket (IPv4 clients arrive as v4-mapped
     // addresses, which the challenge code handles); fall back to IPv4-only.
@@ -121,8 +127,43 @@ async fn main() -> ExitCode {
         None
     };
 
+    // The sink seam: the library delivers PCM to an AlsaSink per stream and
+    // reports session events; the volume path is ours (dB → linear gain,
+    // shared with the sink so slider moves apply live).
+    let gain = SharedGain::new();
+    let sink_gain = gain.clone();
+    let device = args.alsa_device;
+    let sink_factory = move |rate: u32, channels: u8| -> Box<dyn AudioSink> {
+        match &device {
+            Some(dev) => Box::new(AlsaSink::open(dev, rate, channels, sink_gain.clone())),
+            None => Box::new(NullSink),
+        }
+    };
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                Event::Volume { db } => {
+                    debug!("volume {db} dB");
+                    gain.set(volume_to_gain(db));
+                }
+                Event::SessionStarted { rate, channels } => {
+                    info!("session started ({rate} Hz, {channels}ch)");
+                }
+                Event::SessionEnded => info!("session ended"),
+                Event::Flushed => debug!("flushed"),
+                _ => {}
+            }
+        }
+    });
+
+    let context = Arc::new(Context {
+        config,
+        sink_factory: Arc::new(sink_factory),
+        events: event_tx,
+    });
     tokio::select! {
-        result = server::serve(listener, config) => {
+        result = server::serve(listener, context) => {
             if let Err(e) = result {
                 eprintln!("server error: {e}");
                 return ExitCode::FAILURE;
