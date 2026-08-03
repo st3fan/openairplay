@@ -1,4 +1,3 @@
-pub mod alsa_sink;
 pub mod avahi;
 pub mod clock;
 pub mod crypto;

@@ -4,8 +4,9 @@
 //! This is the host side of the sink seam — the library hands it PCM that
 //! should play (prebuffered and start-timed), and it owns the device, the
 //! pacing (blocking `writei`), drift correction against the device queue,
-//! and the gain. The AirPlay volume arrives as an `openairplay::Event::Volume`
-//! in dB; the binary maps it to a linear gain shared with the sink.
+//! and the gain. The AirPlay volume arrives as an
+//! `openairplay1::events::Event::Volume` in dB; the binary maps it to a
+//! linear gain shared with the sink.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use alsa::pcm::{Access, Format, HwParams, State, PCM};
 use alsa::{Direction, ValueOr};
 use log::{debug, info, warn};
 
-use crate::sink::AudioSink;
+use openairplay1::sink::AudioSink;
 
 /// The `SET_PARAMETER` mute sentinel.
 const MUTE_DB: f32 = -144.0;

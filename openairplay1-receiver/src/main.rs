@@ -5,11 +5,13 @@ use std::sync::Arc;
 use log::{debug, info, warn};
 use tokio::net::TcpListener;
 
-use openairplay::alsa_sink::{volume_to_gain, AlsaSink, NullSink, SharedGain};
-use openairplay::events::Event;
-use openairplay::server::{self, Context};
-use openairplay::sink::AudioSink;
-use openairplay::{avahi, mac, Config};
+mod player;
+
+use crate::player::{volume_to_gain, AlsaSink, NullSink, SharedGain};
+use openairplay1::events::Event;
+use openairplay1::server::{self, Context};
+use openairplay1::sink::AudioSink;
+use openairplay1::{avahi, mac, Config};
 
 const DEFAULT_NAME: &str = "OpenAirPlay";
 const DEFAULT_PORT: u16 = 5000;
@@ -28,7 +30,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: openairplay [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
+        "usage: openairplay1-receiver [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
          [--alsa-device DEV] [--no-audio] [--no-avahi]"
     );
     std::process::exit(2);

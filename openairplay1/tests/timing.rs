@@ -10,11 +10,11 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
-use openairplay::clock::ns_to_ntp;
-use openairplay::server::{self, Context};
-use openairplay::session::DecryptedAudio;
-use openairplay::sink::AudioSink;
-use openairplay::Config;
+use openairplay1::clock::ns_to_ntp;
+use openairplay1::server::{self, Context};
+use openairplay1::session::DecryptedAudio;
+use openairplay1::sink::AudioSink;
+use openairplay1::Config;
 
 /// Tests never touch audio hardware: the sink discards everything.
 struct Discard;

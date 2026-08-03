@@ -15,10 +15,10 @@ use rsa::{Oaep, RsaPrivateKey};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
-use openairplay::server::{self, Context};
-use openairplay::session::DecryptedAudio;
-use openairplay::sink::AudioSink;
-use openairplay::{crypto, Config};
+use openairplay1::server::{self, Context};
+use openairplay1::session::DecryptedAudio;
+use openairplay1::sink::AudioSink;
+use openairplay1::{crypto, Config};
 
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 
