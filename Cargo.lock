@@ -166,6 +166,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -809,6 +815,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "jpeg-decoder"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
+
+[[package]]
 name = "js-sys"
 version = "0.3.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1013,7 +1025,7 @@ version = "0.2.0"
 dependencies = [
  "aes",
  "alac",
- "base64",
+ "base64 0.22.1",
  "cbc",
  "log",
  "rand",
@@ -1028,9 +1040,12 @@ name = "openairplay1-receiver"
 version = "0.2.0"
 dependencies = [
  "alsa",
+ "base64 0.23.0",
  "crossterm",
  "env_logger",
  "futures-util",
+ "jpeg-decoder",
+ "libc",
  "log",
  "openairplay1",
  "ratatui",

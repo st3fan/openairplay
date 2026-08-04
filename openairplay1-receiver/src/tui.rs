@@ -10,6 +10,7 @@
 //! so the tests render them through ratatui's `TestBackend` instead of a
 //! real terminal.
 
+use std::io::Write;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,7 @@ use ratatui::Frame;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::images::{self, Placement, Protocol};
 use openairplay1::Event;
 
 /// How often the screen redraws while a track plays, so the elapsed clock
@@ -197,12 +199,18 @@ impl NowPlaying {
         parts.join(" · ")
     }
 
-    /// Draw the whole screen: artwork box on top (filled in by the graphics
-    /// path), text block centered under it.
-    pub fn render(&self, frame: &mut Frame) -> Rect {
+    /// Draw the whole screen: text centered, with a box reserved above it
+    /// for artwork when there is any to draw. The returned rect is where the
+    /// graphics escape should put the image.
+    pub fn render(&self, frame: &mut Frame, cell_aspect: f32) -> Rect {
         let area = frame.area();
         let lines = self.lines(area.width);
-        let (artwork_area, text_area) = layout(area, lines.len() as u16, self.artwork.is_some());
+        let (artwork_area, text_area) = layout(
+            area,
+            lines.len() as u16,
+            self.artwork.is_some(),
+            cell_aspect,
+        );
         frame.render_widget(
             Paragraph::new(lines).alignment(Alignment::Center),
             text_area,
@@ -215,7 +223,7 @@ impl NowPlaying {
 /// together centered vertically. The artwork box is square in *pixels*, so
 /// its height in cells is half its width; it is capped by both the screen
 /// height left over after the text and a fraction of the width.
-fn layout(area: Rect, text_lines: u16, with_artwork: bool) -> (Rect, Rect) {
+fn layout(area: Rect, text_lines: u16, with_artwork: bool, cell_aspect: f32) -> (Rect, Rect) {
     let gap = if with_artwork { 1 } else { 0 };
     let art_height = if with_artwork {
         let by_width = (area.width / 2).min(20);
@@ -233,9 +241,9 @@ fn layout(area: Rect, text_lines: u16, with_artwork: bool) -> (Rect, Rect) {
     ])
     .areas(center_block(area, block));
 
-    // The artwork is centered horizontally over its own two-cells-per-row
-    // aspect, and the gap row sits below it.
-    let art_width = art_height * 2;
+    // Cover art is square, so its width in cells is its height scaled by how
+    // much taller than wide a cell is. The gap row sits below it.
+    let art_width = (art_height as f32 * cell_aspect).round() as u16;
     let artwork = Rect {
         x: top.x + top.width.saturating_sub(art_width) / 2,
         y: top.y,
@@ -299,12 +307,85 @@ pub enum Exit {
 /// **dropped**. Dropping matters: the caller runs this in a `select!` with
 /// the receiver, so the whole loop can be cancelled at an await point, and a
 /// missed restore leaves the user in raw mode with no cursor.
-struct TerminalGuard;
+struct TerminalGuard {
+    images: Protocol,
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Kitty images outlive the alternate screen, so drop ours explicitly.
+        if let Some(escape) = images::clear(self.images) {
+            let _ = std::io::stdout().write_all(&escape);
+        }
         ratatui::restore();
     }
+}
+
+/// What is currently on screen, so a redraw only re-transmits the image when
+/// it has to. Terminal images are not part of ratatui's cell buffer: Kitty
+/// placements survive a redraw, but an iTerm2 image is erased whenever its
+/// cells are rewritten, so the text layout shifting counts as a change too.
+#[derive(PartialEq)]
+struct DrawnArtwork {
+    artwork: Artwork,
+    area: Rect,
+}
+
+/// Send (or remove) the artwork escape when what should be on screen and
+/// what is on screen have diverged.
+fn draw_artwork(
+    images: Protocol,
+    state: &NowPlaying,
+    area: Rect,
+    drawn: &mut Option<DrawnArtwork>,
+) -> std::io::Result<()> {
+    if images == Protocol::None {
+        return Ok(());
+    }
+    let wanted = state
+        .artwork
+        .as_ref()
+        .filter(|_| area.width > 0 && area.height > 0)
+        .map(|artwork| DrawnArtwork {
+            artwork: artwork.clone(),
+            area,
+        });
+    if wanted == *drawn {
+        return Ok(());
+    }
+
+    let mut out = std::io::stdout();
+    if drawn.is_some() {
+        if let Some(escape) = images::clear(images) {
+            out.write_all(&escape)?;
+        }
+    }
+    if let Some(wanted) = &wanted {
+        let placement = Placement {
+            // Escape sequences count from 1; ratatui rects from 0.
+            col: wanted.area.x + 1,
+            row: wanted.area.y + 1,
+            cols: wanted.area.width,
+            rows: wanted.area.height,
+        };
+        match images::draw(
+            images,
+            &wanted.artwork.content_type,
+            &wanted.artwork.data,
+            placement,
+        ) {
+            Some(escape) => out.write_all(&escape)?,
+            // Undecodable artwork: leave the screen text-only rather than
+            // retrying it on every redraw.
+            None => {
+                *drawn = None;
+                return Ok(());
+            }
+        }
+    }
+    out.flush()?;
+    *drawn = wanted;
+    Ok(())
 }
 
 /// Run the full-screen display until the user quits or the receiver stops.
@@ -312,16 +393,25 @@ impl Drop for TerminalGuard {
 /// Owns the terminal for its lifetime: `ratatui::try_init` enables raw mode
 /// and the alternate screen and installs a panic hook that restores them;
 /// [`TerminalGuard`] covers every other way out.
-pub async fn run(mut events: UnboundedReceiver<Event>, name: String) -> std::io::Result<Exit> {
+pub async fn run(
+    mut events: UnboundedReceiver<Event>,
+    name: String,
+    images: Protocol,
+) -> std::io::Result<Exit> {
+    // Cell size has to be read before ratatui takes the terminal over; it
+    // doesn't change unless the font does.
+    let cell_aspect = images::cell_aspect();
     let mut terminal = ratatui::try_init()?;
-    let _guard = TerminalGuard;
-    event_loop(&mut terminal, &mut events, name).await
+    let _guard = TerminalGuard { images };
+    event_loop(&mut terminal, &mut events, name, images, cell_aspect).await
 }
 
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     events: &mut UnboundedReceiver<Event>,
     name: String,
+    images: Protocol,
+    cell_aspect: f32,
 ) -> std::io::Result<Exit> {
     let mut state = NowPlaying::new(name);
     let mut input = EventStream::new();
@@ -329,11 +419,14 @@ async fn event_loop(
     // Raw mode means the terminal sends no SIGINT, but `kill` and systemd
     // still send SIGTERM — catch it so the screen is handed back.
     let mut terminate = signal(SignalKind::terminate())?;
+    let mut drawn: Option<DrawnArtwork> = None;
 
     loop {
+        let mut box_area = Rect::ZERO;
         terminal.draw(|frame| {
-            state.render(frame);
+            box_area = state.render(frame, cell_aspect);
         })?;
+        draw_artwork(images, &state, box_area, &mut drawn)?;
 
         tokio::select! {
             // The receiver's events: the display state.
@@ -372,7 +465,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
-                state.render(frame);
+                state.render(frame, images::DEFAULT_CELL_ASPECT);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -493,17 +586,22 @@ mod tests {
     #[test]
     fn artwork_gets_a_box_above_the_text() {
         let area = Rect::new(0, 0, 60, 24);
-        let (art, text) = layout(area, 6, true);
+        let (art, text) = layout(area, 6, true, images::DEFAULT_CELL_ASPECT);
         assert!(art.height > 0 && art.width == art.height * 2);
         assert!(art.y + art.height <= text.y, "artwork must sit above text");
-        let (none, _) = layout(area, 6, false);
+        let (none, _) = layout(area, 6, false, images::DEFAULT_CELL_ASPECT);
         assert_eq!(none.height, 0, "no artwork, no box");
     }
 
     #[test]
     fn artwork_box_yields_to_a_short_screen() {
         // Eight rows of text on a ten-row screen leaves no room for art.
-        let (art, _) = layout(Rect::new(0, 0, 60, 10), 8, true);
+        let (art, _) = layout(
+            Rect::new(0, 0, 60, 10),
+            8,
+            true,
+            images::DEFAULT_CELL_ASPECT,
+        );
         assert_eq!(art.height, 0);
     }
 

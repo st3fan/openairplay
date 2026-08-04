@@ -113,6 +113,7 @@ RUST_LOG=debug ./target/release/openairplay1-receiver
 | `--no-avahi` | — | Don't advertise the service |
 | `--tui` | — | Full-screen now-playing display instead of log output |
 | `--log-file PATH` | — | Write the log to a file (required to keep logs under `--tui`) |
+| `--tui-images MODE` | `auto` | Terminal graphics for cover art: `auto`, `kitty`, `iterm2`, `none` |
 
 Logging is controlled by `RUST_LOG` (`error`/`warn`/`info`/`debug`); it
 defaults to `info`.
@@ -130,6 +131,12 @@ clock, the sender's address, the stream format and the volume. Press `q` (or
 
 Log output would corrupt the display, so under `--tui` it is dropped unless
 you point it at a file with `--log-file /tmp/receiver.log`.
+
+Cover art is drawn as a real image on terminals that support it — the Kitty
+graphics protocol (**Ghostty**, Kitty, WezTerm) or iTerm2 inline images
+(iTerm2, WezTerm, Konsole). The terminal is detected by asking it (and by
+`TERM`/`TERM_PROGRAM` if it doesn't answer); anywhere else the display is
+text-only. `--tui-images kitty|iterm2|none` overrides the choice.
 
 ## Embedding
 

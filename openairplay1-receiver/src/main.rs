@@ -6,9 +6,11 @@ use std::process::ExitCode;
 
 use log::{debug, info};
 
+mod images;
 mod player;
 mod tui;
 
+use crate::images::Protocol;
 use crate::player::{volume_to_gain, AlsaSink, NullSink, SharedGain};
 use openairplay1::{AudioSink, Event, Receiver};
 
@@ -27,12 +29,15 @@ struct Args {
     /// Where log output goes; stderr when `None` (and nowhere at all under
     /// `--tui`, which owns the screen).
     log_file: Option<String>,
+    /// Forced terminal-graphics protocol, or `None` to detect one.
+    images: Option<Protocol>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: openairplay1-receiver [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
-         [--alsa-device DEV] [--no-audio] [--no-avahi] [--tui] [--log-file PATH]"
+         [--alsa-device DEV] [--no-audio] [--no-avahi] [--tui] [--log-file PATH] \
+         [--tui-images auto|kitty|iterm2|none]"
     );
     std::process::exit(2);
 }
@@ -56,6 +61,7 @@ fn parse_args() -> Args {
         alsa_device: Some(DEFAULT_ALSA_DEVICE.to_string()),
         tui: false,
         log_file: None,
+        images: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -80,6 +86,13 @@ fn parse_args() -> Args {
             "--no-audio" => args.alsa_device = None,
             "--tui" => args.tui = true,
             "--log-file" => args.log_file = Some(it.next().unwrap_or_else(|| usage())),
+            "--tui-images" => {
+                let value = it.next().unwrap_or_else(|| usage());
+                args.images = match value.as_str() {
+                    "auto" => None,
+                    other => Some(Protocol::parse(other).unwrap_or_else(|| usage())),
+                };
+            }
             "--no-avahi" => args.avahi = false,
             "-h" | "--help" => usage(),
             other => {
@@ -228,6 +241,13 @@ async fn main() -> ExitCode {
         // raw mode, so it arrives as a key event inside the TUI, and
         // cancelling the TUI future from outside would skip its restore.
         let name = receiver.config().name.clone();
+        // Detection has to happen before ratatui owns the terminal: the
+        // probe writes a query and reads the answer itself.
+        let images = args.images.unwrap_or_else(|| {
+            let probe = images::probe_kitty(std::time::Duration::from_millis(100));
+            images::detect(|name| std::env::var(name).ok(), probe)
+        });
+        info!("terminal graphics: {images:?}");
         tokio::select! {
             result = receiver.run(sink_factory, event_tx) => {
                 if let Err(e) = result {
@@ -235,7 +255,7 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
-            exit = tui::run(ui_rx, name) => {
+            exit = tui::run(ui_rx, name, images) => {
                 if let Err(e) = exit {
                     eprintln!("display error: {e}");
                     return ExitCode::FAILURE;
