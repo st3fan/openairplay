@@ -1,0 +1,35 @@
+# CI: the full workspace on Linux (the target platform), and the library
+# alone on macOS — the library's macOS portability is a deliverable
+# (see CLAUDE.md), enforced here rather than by discipline.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ALSA headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt --check
+
+  macos:
+    name: macOS (library)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p openairplay1
+      - run: cargo clippy -p openairplay1 --all-targets -- -D warnings
