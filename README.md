@@ -151,7 +151,11 @@ async fn main() -> std::io::Result<()> {
 The library keeps the session semantics (RTSP handshake, decrypt, jitter
 buffer and retransmits, the NTP clock model, ALAC decode, the prebuffer and
 latency-correct start, FLUSH handling); the host sees only PCM and events —
-`SessionStarted`, `Volume` (in AirPlay dB), `Flushed`, `SessionEnded`. A
+`SessionStarted`, `Volume` (in AirPlay dB), `Metadata` (track title, artist,
+album), `Artwork` (cover art bytes as sent), `Flushed`, `SessionEnded`.
+`Metadata` and `Artwork` arrive only between `SessionStarted` and
+`SessionEnded`; each `Metadata` is a complete statement about the current
+track, not a delta, and empty `Artwork` data means the sender cleared it. A
 host that owns its mDNS registration builds with `.advertise(false)` and
 publishes `receiver.txt_records()` itself under
 `receiver.config().service_name()`.
@@ -175,6 +179,7 @@ play the stream. The workspace has two crates:
 | `jitter` | Sequence-ordered jitter buffer with loss reporting |
 | `clock` | NTP offset model, sync anchor, `play_time` |
 | `decode` | ALAC decoding (via the `alac` crate) |
+| `dmap` | DMAP/DAAP walker for the sender's track metadata |
 | `player` | Playback thread: prebuffer, timed start, feeding the host's sink |
 | `sink` / `events` | The host boundary: `AudioSink` trait, session `Event`s |
 | `avahi` | `_raop._tcp` registration over the Avahi D-Bus API |

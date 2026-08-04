@@ -7,7 +7,11 @@ use std::io;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 const MAX_HEADERS: usize = 128;
-const MAX_BODY: usize = 1024 * 1024;
+/// Bodies above this are refused (which drops the connection). Cover art
+/// arrives as a `SET_PARAMETER` body of tens to hundreds of KB, so the cap
+/// has to sit well above that: at 8 MB it only catches a sender that has
+/// gone wrong, never a legitimate payload.
+const MAX_BODY: usize = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct Request {

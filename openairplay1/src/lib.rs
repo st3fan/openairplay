@@ -37,6 +37,7 @@
 
 mod avahi;
 mod decode;
+mod dmap;
 mod events;
 mod jitter;
 mod mac;

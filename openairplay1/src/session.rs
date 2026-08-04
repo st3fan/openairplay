@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 
 use crate::clock::{self, ClockModel};
 use crate::crypto;
+use crate::dmap;
 use crate::events::{Event, EventSender};
 use crate::jitter::{Delivery, JitterBuffer};
 use crate::player::{Player, PlayerSender};
@@ -29,6 +30,8 @@ use crate::sink::SinkFactory;
 const SERVICE_INTERVAL: Duration = Duration::from_millis(20);
 /// Minimum spacing between resend requests for the same sequence number.
 const RESEND_BACKOFF: Duration = Duration::from_millis(80);
+/// `SET_PARAMETER` content type carrying DMAP track metadata.
+const DMAP_CONTENT_TYPE: &str = "application/x-dmap-tagged";
 
 /// A single-streaming-session gate shared across RTSP connections. AirPlay 1
 /// senders assume exclusive use of the receiver; a second one that reaches
@@ -96,6 +99,12 @@ pub struct Session {
     /// True between SETUP and TEARDOWN/drop; guards the one-time
     /// [`Event::SessionEnded`].
     streaming: bool,
+    /// Metadata/artwork that arrived while no session was active (senders
+    /// may push them earlier in the handshake, before SETUP). The latest of
+    /// each is latched here and delivered right after `SessionStarted`, so
+    /// the host only ever sees them inside a session.
+    pending_metadata: Option<Event>,
+    pending_artwork: Option<Event>,
     player: Option<Player>,
     /// Signals the audio task to flush its jitter buffer to a given sequence
     /// (or re-anchor when `None`).
@@ -124,6 +133,8 @@ impl Session {
             sink_factory,
             events,
             streaming: false,
+            pending_metadata: None,
+            pending_artwork: None,
             player: None,
             flush_tx: None,
             peer_ip,
@@ -246,11 +257,17 @@ impl Session {
             rate: params.alac.sample_rate,
             channels: params.alac.channels,
         });
+        self.streaming = true;
+        // Replay metadata/artwork that arrived before the session started,
+        // so they land inside it.
+        let latched = [self.pending_metadata.take(), self.pending_artwork.take()];
+        for event in latched.into_iter().flatten() {
+            self.send_event(event);
+        }
         let sink = (self.sink_factory)(params.alac.sample_rate, params.alac.channels);
         let player = Player::spawn(&params.alac, sink, clock.clone());
         let player_sender = player.sender();
         self.player = Some(player);
-        self.streaming = true;
 
         // Share the control socket: the audio task sends resend requests on it
         // while the control task reads sync packets.
@@ -332,19 +349,90 @@ impl Session {
                 Some(Response::ok())
             }
             "SET_PARAMETER" => {
-                let body = String::from_utf8_lossy(&request.body);
-                for line in body.lines() {
-                    if let Some(v) = line.trim().strip_prefix("volume:") {
-                        if let Ok(db) = v.trim().parse::<f32>() {
-                            debug!("SET_PARAMETER volume {db} dB");
-                            self.send_event(Event::Volume { db });
-                        }
-                    }
-                }
+                self.set_parameter(request.headers.get("Content-Type"), &request.body);
                 Some(Response::ok())
             }
             "GET_PARAMETER" => Some(Response::ok()),
             _ => None,
+        }
+    }
+
+    /// Apply a `SET_PARAMETER` body, dispatched on its `Content-Type`:
+    /// DMAP track metadata, cover art, or (the default) `text/parameters`
+    /// lines — currently the volume.
+    fn set_parameter(&mut self, content_type: Option<&str>, body: &[u8]) {
+        // Strip any parameters ("; charset=...") from the media type.
+        let media_type = content_type.map(|ct| ct.split(';').next().unwrap_or(ct).trim());
+        match media_type {
+            Some(ct) if ct.eq_ignore_ascii_case(DMAP_CONTENT_TYPE) => self.set_metadata(body),
+            Some(ct)
+                if ct
+                    .get(..6)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("image/")) =>
+            {
+                self.set_artwork(ct, body)
+            }
+            _ => self.set_text_parameters(body),
+        }
+    }
+
+    /// The `text/parameters` flavor — currently just the volume line. The
+    /// library does not apply gain; the host owns that path.
+    fn set_text_parameters(&mut self, body: &[u8]) {
+        let text = String::from_utf8_lossy(body);
+        for line in text.lines() {
+            if let Some(v) = line.trim().strip_prefix("volume:") {
+                if let Ok(db) = v.trim().parse::<f32>() {
+                    debug!("SET_PARAMETER volume {db} dB");
+                    self.send_event(Event::Volume { db });
+                }
+            }
+        }
+    }
+
+    /// DMAP track metadata. Metadata is decoration: an unparseable payload
+    /// is dropped with a debug log, never an error to the sender.
+    fn set_metadata(&mut self, body: &[u8]) {
+        let Some(meta) = dmap::parse(body) else {
+            debug!(
+                "SET_PARAMETER metadata: unrecognized DMAP payload ({} bytes)",
+                body.len()
+            );
+            return;
+        };
+        debug!(
+            "SET_PARAMETER metadata: title={:?} artist={:?} album={:?}",
+            meta.title, meta.artist, meta.album
+        );
+        self.send_session_event(Event::Metadata {
+            title: meta.title,
+            artist: meta.artist,
+            album: meta.album,
+        });
+    }
+
+    /// Cover art, forwarded as-is (`image/none`/empty means cleared).
+    fn set_artwork(&mut self, content_type: &str, body: &[u8]) {
+        debug!(
+            "SET_PARAMETER artwork: {content_type}, {} bytes",
+            body.len()
+        );
+        self.send_session_event(Event::Artwork {
+            content_type: content_type.to_string(),
+            data: body.to_vec(),
+        });
+    }
+
+    /// Deliver an event the host expects only inside a session; before
+    /// `SessionStarted` it is latched (latest wins) and replayed once the
+    /// session starts.
+    fn send_session_event(&mut self, event: Event) {
+        if self.streaming {
+            self.send_event(event);
+        } else if matches!(event, Event::Artwork { .. }) {
+            self.pending_artwork = Some(event);
+        } else {
+            self.pending_metadata = Some(event);
         }
     }
 
@@ -822,6 +910,139 @@ mod tests {
         // The client disconnected without TEARDOWN.
         drop(session);
         assert_eq!(events.try_recv(), Ok(Event::SessionEnded));
+    }
+
+    /// A one-track DMAP payload: `mlit` wrapping title/artist/album.
+    fn dmap_track(title: &str) -> Vec<u8> {
+        fn entry(tag: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut e = tag.to_vec();
+            e.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            e.extend_from_slice(payload);
+            e
+        }
+        let inner = [
+            entry(b"minm", title.as_bytes()),
+            entry(b"asar", b"The Artist"),
+            entry(b"asal", b"The Album"),
+        ]
+        .concat();
+        entry(b"mlit", &inner)
+    }
+
+    /// Drive ANNOUNCE → SETUP so the session is streaming, and consume the
+    /// resulting `SessionStarted`.
+    async fn start_session(
+        session: &mut Session,
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    ) {
+        let announce = request(&format!(
+            "ANNOUNCE rtsp://192.168.1.10/1 RTSP/1.0\r\n\
+             CSeq: 2\r\nContent-Length: {}\r\n\r\n{SDP_BODY}",
+            SDP_BODY.len()
+        ))
+        .await;
+        session.handle_announce(&announce);
+        let setup = request(
+            "SETUP rtsp://192.168.1.10/1 RTSP/1.0\r\n\
+             CSeq: 3\r\n\
+             Transport: RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002\r\n\
+             \r\n",
+        )
+        .await;
+        session
+            .handle_setup(&setup, IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await;
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::SessionStarted {
+                rate: 44100,
+                channels: 2
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn set_parameter_dispatches_on_content_type() {
+        let (mut session, mut events) = session();
+        start_session(&mut session, &mut events).await;
+
+        session.set_parameter(Some(DMAP_CONTENT_TYPE), &dmap_track("Song"));
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::Metadata {
+                title: Some("Song".into()),
+                artist: Some("The Artist".into()),
+                album: Some("The Album".into()),
+            })
+        );
+
+        // Artwork is forwarded byte-for-byte, content type included.
+        session.set_parameter(Some("image/png"), b"\x89PNG");
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::Artwork {
+                content_type: "image/png".into(),
+                data: b"\x89PNG".to_vec(),
+            })
+        );
+
+        // image/none with an empty body is the sender clearing the art.
+        session.set_parameter(Some("image/none"), b"");
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::Artwork {
+                content_type: "image/none".into(),
+                data: Vec::new(),
+            })
+        );
+
+        // The volume path is unchanged, with or without a charset parameter.
+        session.set_parameter(Some("text/parameters; charset=utf-8"), b"volume: -12.5\r\n");
+        assert_eq!(events.try_recv(), Ok(Event::Volume { db: -12.5 }));
+        session.set_parameter(None, b"volume: -6.0\r\n");
+        assert_eq!(events.try_recv(), Ok(Event::Volume { db: -6.0 }));
+
+        // Anything else is acknowledged but produces no event.
+        session.set_parameter(Some("application/octet-stream"), b"\x00\x01");
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn metadata_before_setup_is_latched_until_session_start() {
+        // Senders may push metadata during the handshake, but the host's
+        // contract is that it only arrives inside a session — so the latest
+        // of each is held and replayed after SessionStarted.
+        let (mut session, mut events) = session();
+        session.set_parameter(Some(DMAP_CONTENT_TYPE), &dmap_track("First"));
+        session.set_parameter(Some(DMAP_CONTENT_TYPE), &dmap_track("Second"));
+        session.set_parameter(Some("image/jpeg"), b"JPEG");
+        assert!(events.try_recv().is_err(), "nothing before SessionStarted");
+
+        start_session(&mut session, &mut events).await;
+
+        // Latest metadata wins, and each is replayed exactly once.
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::Metadata { title: Some(t), .. }) if t == "Second"
+        ));
+        assert!(matches!(events.try_recv(), Ok(Event::Artwork { .. })));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_metadata_is_ignored_and_never_ends_the_session() {
+        let (mut session, mut events) = session();
+        start_session(&mut session, &mut events).await;
+
+        session.set_parameter(Some(DMAP_CONTENT_TYPE), b"");
+        session.set_parameter(Some(DMAP_CONTENT_TYPE), b"garbage, not dmap");
+        // An mlit whose declared length runs off the end of the payload.
+        session.set_parameter(Some(DMAP_CONTENT_TYPE), b"mlit\x00\x00\xff\xff");
+        assert!(events.try_recv().is_err(), "no event from bad payloads");
+
+        // The session is still live and still handling parameters.
+        session.set_parameter(Some("text/parameters"), b"volume: -6.0\r\n");
+        assert_eq!(events.try_recv(), Ok(Event::Volume { db: -6.0 }));
     }
 
     #[test]
