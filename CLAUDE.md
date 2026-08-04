@@ -9,7 +9,7 @@ An AirPlay 1 (RAOP / AirTunes) audio **receiver** (Rust) — the AirPlay 1 count
 iTunes) discover it, handshake with it, and stream ALAC to it over RTP/UDP; audio comes out of an
 ALSA device with seek/volume and a latency-correct start.
 
-A cargo workspace with two members:
+A cargo workspace with four members:
 
 - **`openairplay1/`** — the embeddable library: network → PCM. Owns discovery advertisement, the
   RTSP handshake (`Apple-Challenge`), the three UDP channels, decrypt, the jitter buffer with
@@ -18,12 +18,26 @@ A cargo workspace with two members:
   `AudioSink`, `Event`, `Config`, `txt_records` — everything else is private or `#[doc(hidden)]`
   (test-sender pieces: `server`, `crypto`, `clock`, `DecryptedAudio`/`AudioObserver`).
 - **`openairplay1-receiver/`** — the standalone Linux-only binary: CLI + `AlsaSink` (ALSA output,
-  frame-stuffing drift correction, dB→linear gain). It consumes only the library's public API
-  (it is embedder #1).
+  frame-stuffing drift correction, dB→linear gain), plus the dashboard WebSocket endpoint
+  ([dashboard.rs](openairplay1-receiver/src/dashboard.rs), `--dashboard-listen`). It consumes
+  only the library's public API (it is embedder #1).
+- **`openairplay1-dashboard/`** — the full-screen now-playing display, a **separate program**
+  that connects to a receiver over that WebSocket:
+  [tui.rs](openairplay1-dashboard/src/tui.rs) (ratatui screen; the layout and formatting are
+  pure functions tested through `TestBackend`),
+  [images.rs](openairplay1-dashboard/src/images.rs) (Kitty/iTerm2 cover art — detection **fails
+  closed**, because graphics escapes at a terminal that can't read them spray base64 over the
+  screen), [client.rs](openairplay1-dashboard/src/client.rs) (reconnecting WebSocket client).
+  It knows nothing about AirPlay: it depends only on the protocol crate.
+- **`openairplay1-dashboard-protocol/`** — the wire types the receiver and the dashboard share:
+  a tagged `Message` enum plus the `Snapshot` sent on connect. A JSON-fixture test pins the
+  exact bytes — treat that format as published, since anything speaking WebSocket (a browser,
+  say) may be reading it.
 
 Deliberate scope: **one sender → one stream → one output** (a second sender is refused `453`).
-Also out of scope: `PAUSE` (answered `501`), metadata/DACP, password protection, AirPlay 2
-(HomeKit pairing, PTP multi-room), video/screen mirroring.
+Also out of scope: `PAUSE` (answered `501`), DACP transport control, password protection,
+AirPlay 2 (HomeKit pairing, PTP multi-room), video/screen mirroring. The dashboard socket is
+read-only and unauthenticated by design — loopback by default, reverse proxy for anything else.
 
 ## Build, test, run
 
@@ -38,12 +52,19 @@ cargo build --release && cargo test && cargo clippy --all-targets && cargo fmt -
 
 ```bash
 cargo test -p openairplay1             # library only (the macOS-portable subset)
+cargo test -p openairplay1-dashboard   # the display: layout and artwork encoders
 cargo test drift_action                # one unit test by name (receiver crate)
 cargo test --test handshake            # one integration test file
 ```
 
 ```bash
 RUST_LOG=debug ./target/release/openairplay1-receiver --name "Living Room" --alsa-device default
+```
+
+```bash
+# receiver publishing to a dashboard, and the dashboard itself
+./target/release/openairplay1-receiver --dashboard-listen 127.0.0.1:7392
+./target/release/openairplay1-dashboard --connect ws://127.0.0.1:7392
 ```
 
 `RUST_LOG=debug` logs every RTSP request head and body — the way to see what a real sender

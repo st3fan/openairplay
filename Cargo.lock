@@ -1130,6 +1130,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "openairplay1-dashboard"
+version = "0.2.0"
+dependencies = [
+ "base64 0.23.0",
+ "crossterm",
+ "env_logger",
+ "futures-util",
+ "jpeg-decoder",
+ "libc",
+ "log",
+ "openairplay1-dashboard-protocol",
+ "ratatui",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "openairplay1-dashboard-protocol"
 version = "0.2.0"
 dependencies = [
@@ -1143,15 +1161,11 @@ version = "0.2.0"
 dependencies = [
  "alsa",
  "base64 0.23.0",
- "crossterm",
  "env_logger",
  "futures-util",
- "jpeg-decoder",
- "libc",
  "log",
  "openairplay1",
  "openairplay1-dashboard-protocol",
- "ratatui",
  "serde_json",
  "tokio",
  "tokio-tungstenite",

@@ -13,6 +13,9 @@ audio to it. This repo produces two artifacts:
   macOS. See [Embedding](#embedding).
 - **`openairplay1-receiver`** — the standalone **Linux/ALSA binary** built
   on it: point Control Center (or the AirPlay menu) at it and press play.
+- **`openairplay1-dashboard`** — a **full-screen now-playing display** that
+  connects to a receiver over a WebSocket and draws the current track and its
+  cover art in your terminal. See [Now-playing display](#now-playing-display).
 
 It implements the full RAOP audio path: mDNS discovery, the RTSP handshake
 with the `Apple-Challenge` response, AES/RSA decryption, ALAC decode, a
@@ -111,42 +114,64 @@ RUST_LOG=debug ./target/release/openairplay1-receiver
 | `--alsa-device DEV` | `default` | ALSA output device |
 | `--no-audio` | — | Decode only; don't open an audio device |
 | `--no-avahi` | — | Don't advertise the service |
-| `--tui` | — | Full-screen now-playing display instead of log output |
-| `--log-file PATH` | — | Write the log to a file (required to keep logs under `--tui`) |
-| `--tui-images MODE` | `auto` | Terminal graphics for cover art: `auto`, `kitty`, `iterm2`, `none` |
+| `--log-file PATH` | — | Write the log to a file instead of stderr |
 | `--dashboard-listen ADDR` | — | Serve the now-playing WebSocket on `ADDR` (e.g. `127.0.0.1:7392`) |
 
 Logging is controlled by `RUST_LOG` (`error`/`warn`/`info`/`debug`); it
 defaults to `info`.
 
-### Now-playing display
+## Now-playing display
 
-`--tui` takes over the terminal and shows what is currently playing — track
-title, artist and album centered on screen, with the cover art, a progress
-clock, the sender's address, the stream format and the volume. Press `q` (or
-`Ctrl-C`) to quit.
+`openairplay1-dashboard` is a separate program: start it, stop it, restart it,
+or run it on another machine, without touching the receiver. It shows the
+current track centered on screen with its cover art, a progress clock, the
+sender's address, the stream format and the volume.
 
 ```sh
-./target/release/openairplay1-receiver --name "Living Room" --tui
+# receiver, publishing what it plays
+./target/release/openairplay1-receiver --name "Living Room" \
+    --dashboard-listen 127.0.0.1:7392
+
+# display, in another terminal (or on another machine)
+./target/release/openairplay1-dashboard --connect ws://127.0.0.1:7392
 ```
 
-Log output would corrupt the display, so under `--tui` it is dropped unless
-you point it at a file with `--log-file /tmp/receiver.log`.
+```
+                     Sonata No. 1
+                      Some Artist
+                       Some Album
+
+                ━━━━━━━──────────────
+                    1:23 / 4:07
+
+   Living Room · 192.168.1.42 · 44100 Hz 2ch · -12.5 dB
+```
 
 Cover art is drawn as a real image on terminals that support it — the Kitty
 graphics protocol (**Ghostty**, Kitty, WezTerm) or iTerm2 inline images
 (iTerm2, WezTerm, Konsole). The terminal is detected by asking it (and by
 `TERM`/`TERM_PROGRAM` if it doesn't answer); anywhere else the display is
-text-only. `--tui-images kitty|iterm2|none` overrides the choice.
+text-only. Press `q` (or `Ctrl-C`) to quit.
 
-### Dashboard endpoint
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--connect URL` | `ws://127.0.0.1:7392` | Receiver's dashboard endpoint |
+| `--images MODE` | `auto` | Terminal graphics: `auto`, `kitty`, `iterm2`, `none` |
+| `--log-file PATH` | — | Write the log to a file (the display owns the screen, so logs are otherwise dropped) |
 
-`--dashboard-listen 127.0.0.1:7392` publishes what is playing as JSON text
-frames on a WebSocket: a `snapshot` message on connect with everything the
-receiver currently knows, then one message per change (`session_started`,
-`metadata`, `artwork` as base64, `volume`, `progress`, `flushed`,
-`session_ended`). The message types live in
-[`openairplay1-dashboard-protocol`](openairplay1-dashboard-protocol/src/lib.rs).
+The dashboard reconnects on its own: it can be started before the receiver,
+and it survives the receiver restarting under it, showing the connection state
+in place of a stale screen.
+
+### The endpoint
+
+`--dashboard-listen` publishes what is playing as JSON text frames on a
+WebSocket: a `snapshot` message on connect with everything the receiver
+currently knows, then one message per change (`session_started`, `metadata`,
+`artwork` as base64, `volume`, `progress`, `flushed`, `session_ended`). The
+message types live in
+[`openairplay1-dashboard-protocol`](openairplay1-dashboard-protocol/src/lib.rs),
+so anything that speaks WebSocket — a browser, say — can consume it.
 
 It is off unless the flag is given, and worth keeping on loopback (or behind a
 reverse proxy): the stream carries now-playing metadata and cover art, and
@@ -226,7 +251,14 @@ play the stream. The workspace has two crates:
 
 **`openairplay1-receiver/`** — the binary (PCM → speaker): the CLI plus the
 ALSA sink (blocking `writei`, frame-stuffing drift correction, dB→linear
-gain); it consumes only the library's public API.
+gain) and the dashboard WebSocket; it consumes only the library's public API.
+
+**`openairplay1-dashboard/`** — the display: a WebSocket client with
+reconnect, the ratatui screen, and the Kitty/iTerm2 artwork encoders. It knows
+nothing about AirPlay — only the protocol crate.
+
+**`openairplay1-dashboard-protocol/`** — the message types the receiver and
+the dashboard share (serde only, no I/O).
 
 See [`notes/design.md`](notes/design.md) for the protocol design, and
 `notes/milestone-*.md` for how each part was built and verified.

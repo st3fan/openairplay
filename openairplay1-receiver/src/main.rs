@@ -7,11 +7,8 @@ use std::process::ExitCode;
 use log::{debug, info};
 
 mod dashboard;
-mod images;
 mod player;
-mod tui;
 
-use crate::images::Protocol;
 use crate::player::{volume_to_gain, AlsaSink, NullSink, SharedGain};
 use openairplay1::{AudioSink, Event, Receiver};
 
@@ -25,13 +22,8 @@ struct Args {
     avahi: bool,
     /// ALSA device, or `None` for `--no-audio`.
     alsa_device: Option<String>,
-    /// Full-screen now-playing display instead of log output.
-    tui: bool,
-    /// Where log output goes; stderr when `None` (and nowhere at all under
-    /// `--tui`, which owns the screen).
+    /// Where log output goes; stderr when `None`.
     log_file: Option<String>,
-    /// Forced terminal-graphics protocol, or `None` to detect one.
-    images: Option<Protocol>,
     /// Address to serve the dashboard WebSocket on; off when `None`.
     dashboard_listen: Option<String>,
 }
@@ -39,8 +31,8 @@ struct Args {
 fn usage() -> ! {
     eprintln!(
         "usage: openairplay1-receiver [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
-         [--alsa-device DEV] [--no-audio] [--no-avahi] [--tui] [--log-file PATH] \
-         [--tui-images auto|kitty|iterm2|none] [--dashboard-listen ADDR]"
+         [--alsa-device DEV] [--no-audio] [--no-avahi] [--log-file PATH] \
+         [--dashboard-listen ADDR]"
     );
     std::process::exit(2);
 }
@@ -62,9 +54,7 @@ fn parse_args() -> Args {
         mac: None,
         avahi: true,
         alsa_device: Some(DEFAULT_ALSA_DEVICE.to_string()),
-        tui: false,
         log_file: None,
-        images: None,
         dashboard_listen: None,
     };
     let mut it = std::env::args().skip(1);
@@ -88,17 +78,9 @@ fn parse_args() -> Args {
             }
             "--alsa-device" => args.alsa_device = Some(it.next().unwrap_or_else(|| usage())),
             "--no-audio" => args.alsa_device = None,
-            "--tui" => args.tui = true,
             "--log-file" => args.log_file = Some(it.next().unwrap_or_else(|| usage())),
             "--dashboard-listen" => {
                 args.dashboard_listen = Some(it.next().unwrap_or_else(|| usage()))
-            }
-            "--tui-images" => {
-                let value = it.next().unwrap_or_else(|| usage());
-                args.images = match value.as_str() {
-                    "auto" => None,
-                    other => Some(Protocol::parse(other).unwrap_or_else(|| usage())),
-                };
             }
             "--no-avahi" => args.avahi = false,
             "-h" | "--help" => usage(),
@@ -111,22 +93,14 @@ fn parse_args() -> Args {
     args
 }
 
-/// Point the logger at the right sink. `--log-file` wins; otherwise stderr,
-/// except under `--tui`, where stderr would shred the display and the log is
-/// dropped unless the user asked for a file.
+/// Point the logger at the right sink: `--log-file` if given, else stderr.
 fn init_logging(args: &Args) -> Result<(), String> {
     let mut builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
-    match (&args.log_file, args.tui) {
-        (Some(path), _) => {
-            let file = std::fs::File::create(path)
-                .map_err(|e| format!("cannot write log file {path:?}: {e}"))?;
-            builder.target(env_logger::Target::Pipe(Box::new(file)));
-        }
-        (None, true) => {
-            builder.target(env_logger::Target::Pipe(Box::new(std::io::sink())));
-        }
-        (None, false) => {}
+    if let Some(path) = &args.log_file {
+        let file = std::fs::File::create(path)
+            .map_err(|e| format!("cannot write log file {path:?}: {e}"))?;
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
     }
     builder.init();
     Ok(())
@@ -243,9 +217,7 @@ async fn main() -> ExitCode {
 
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     // Events drive our gain (always), the dashboard socket (when serving),
-    // and the display — the log normally, the TUI when it owns the screen.
-    let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
-    let tui_mode = args.tui;
+    // and the log.
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             if let Event::Volume { db } = &event {
@@ -255,44 +227,9 @@ async fn main() -> ExitCode {
             if let Some(publisher) = &publisher {
                 publisher.publish(&event);
             }
-            if tui_mode {
-                if ui_tx.send(event).is_err() {
-                    break; // the display is gone; nothing left to update
-                }
-            } else {
-                log_event(event);
-            }
+            log_event(event);
         }
     });
-
-    if args.tui {
-        // Ctrl-C is deliberately not selected on here: the terminal is in
-        // raw mode, so it arrives as a key event inside the TUI, and
-        // cancelling the TUI future from outside would skip its restore.
-        let name = receiver.config().name.clone();
-        // Detection has to happen before ratatui owns the terminal: the
-        // probe writes a query and reads the answer itself.
-        let images = args.images.unwrap_or_else(|| {
-            let probe = images::probe_kitty(std::time::Duration::from_millis(100));
-            images::detect(|name| std::env::var(name).ok(), probe)
-        });
-        info!("terminal graphics: {images:?}");
-        tokio::select! {
-            result = receiver.run(sink_factory, event_tx) => {
-                if let Err(e) = result {
-                    eprintln!("server error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-            exit = tui::run(ui_rx, name, images) => {
-                if let Err(e) = exit {
-                    eprintln!("display error: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-        return ExitCode::SUCCESS;
-    }
 
     tokio::select! {
         result = receiver.run(sink_factory, event_tx) => {

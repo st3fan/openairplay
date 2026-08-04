@@ -1,9 +1,8 @@
-//! `--tui`: a full-screen now-playing display.
+//! The full-screen now-playing display.
 //!
-//! The receiver's event stream is the whole data model — this module keeps
-//! the latest [`Event`] values in [`NowPlaying`] and draws them centered on
-//! the screen. It is a pure consumer of the library's public API, like the
-//! rest of the binary.
+//! The receiver's message stream is the whole data model — this module keeps
+//! the latest [`Message`] values in [`NowPlaying`] and draws them centered on
+//! the screen.
 //!
 //! Everything that decides *what the screen looks like* is in
 //! [`NowPlaying::lines`] and [`layout`], which take no terminal and no I/O,
@@ -11,7 +10,6 @@
 //! real terminal.
 
 use std::io::Write;
-use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
@@ -24,8 +22,11 @@ use ratatui::Frame;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::client::Update;
 use crate::images::{self, Placement, Protocol};
-use openairplay1::Event;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use openairplay1_dashboard_protocol::{Message, Snapshot};
 
 /// How often the screen redraws while a track plays, so the elapsed clock
 /// advances between the sender's (infrequent) progress updates.
@@ -36,7 +37,17 @@ const TICK: Duration = Duration::from_millis(500);
 struct Session {
     rate: u32,
     channels: u8,
-    peer: IpAddr,
+    peer: String,
+}
+
+/// Whether we can see the receiver at all — shown in place of the track when
+/// the socket is down, so a stale screen is never mistaken for live state.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+enum Connection {
+    #[default]
+    Connecting,
+    Connected,
+    Lost,
 }
 
 /// The last position the sender reported, and when we heard it — the clock
@@ -56,11 +67,13 @@ pub struct Artwork {
     pub data: Vec<u8>,
 }
 
-/// Everything the screen shows, updated from the event stream.
+/// Everything the screen shows, updated from the message stream.
 #[derive(Debug, Default)]
 pub struct NowPlaying {
-    /// The receiver's own advertised name, shown when idle and in the
-    /// status line.
+    /// Where we are connecting to, shown until a receiver answers.
+    endpoint: String,
+    connection: Connection,
+    /// The receiver's advertised name, from its snapshot.
     name: String,
     session: Option<Session>,
     title: Option<String>,
@@ -72,21 +85,34 @@ pub struct NowPlaying {
 }
 
 impl NowPlaying {
-    pub fn new(name: String) -> NowPlaying {
+    pub fn new(endpoint: String) -> NowPlaying {
         NowPlaying {
-            name,
+            endpoint,
             ..NowPlaying::default()
         }
     }
 
-    /// Fold one event into the display state.
-    pub fn apply(&mut self, event: Event) {
-        match event {
-            Event::SessionStarted {
+    /// Fold one client update into the display state.
+    pub fn apply(&mut self, update: Update) {
+        match update {
+            Update::Connected => self.connection = Connection::Connected,
+            Update::Disconnected => {
+                self.connection = Connection::Lost;
+                // Keep the last track on screen but stop the clock: without a
+                // receiver we no longer know that it is still running.
+                self.progress = None;
+            }
+            Update::Message(message) => self.apply_message(*message),
+        }
+    }
+
+    fn apply_message(&mut self, message: Message) {
+        match message {
+            Message::Snapshot(snapshot) => self.apply_snapshot(snapshot),
+            Message::SessionStarted {
                 rate,
                 channels,
                 peer,
-                ..
             } => {
                 self.session = Some(Session {
                     rate,
@@ -94,7 +120,7 @@ impl NowPlaying {
                     peer,
                 });
             }
-            Event::Metadata {
+            Message::Metadata {
                 title,
                 artist,
                 album,
@@ -104,21 +130,25 @@ impl NowPlaying {
                 self.artist = artist;
                 self.album = album;
             }
-            Event::Artwork { content_type, data } => {
-                self.artwork = (!data.is_empty()).then_some(Artwork { content_type, data });
-            }
-            Event::Volume { db } => self.volume_db = Some(db),
-            Event::Progress { elapsed, duration } => {
+            Message::Artwork {
+                content_type,
+                data_base64,
+            } => self.artwork = decode_artwork(&content_type, &data_base64),
+            Message::Volume { db } => self.volume_db = Some(db),
+            Message::Progress {
+                elapsed_ms,
+                duration_ms,
+            } => {
                 self.progress = Some(Progress {
-                    elapsed,
-                    duration,
+                    elapsed: Duration::from_millis(elapsed_ms),
+                    duration: Duration::from_millis(duration_ms),
                     at: Instant::now(),
                 });
             }
             // A seek invalidates the position until the sender sends a new
             // one, which it does immediately after.
-            Event::Flushed => self.progress = None,
-            Event::SessionEnded => {
+            Message::Flushed => self.progress = None,
+            Message::SessionEnded => {
                 self.session = None;
                 self.title = None;
                 self.artist = None;
@@ -128,6 +158,30 @@ impl NowPlaying {
             }
             _ => {}
         }
+    }
+
+    /// Replace everything from a snapshot — what a dashboard gets on connect,
+    /// and again if the receiver decides it fell behind.
+    fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        self.name = snapshot.receiver.name;
+        self.session = snapshot.session.map(|s| Session {
+            rate: s.rate,
+            channels: s.channels,
+            peer: s.peer,
+        });
+        let track = snapshot.track.unwrap_or_default();
+        self.title = track.title;
+        self.artist = track.artist;
+        self.album = track.album;
+        self.volume_db = snapshot.volume_db;
+        self.progress = snapshot.progress.map(|p| Progress {
+            elapsed: Duration::from_millis(p.elapsed_ms),
+            duration: Duration::from_millis(p.duration_ms),
+            at: Instant::now(),
+        });
+        self.artwork = snapshot
+            .artwork
+            .and_then(|a| decode_artwork(&a.content_type, &a.data_base64));
     }
 
     fn playing(&self) -> bool {
@@ -149,6 +203,18 @@ impl NowPlaying {
     /// the progress clock, and the status line.
     fn lines(&self, width: u16) -> Vec<Line<'_>> {
         let mut lines = Vec::new();
+        if self.connection != Connection::Connected {
+            lines.push(Line::from(self.endpoint.as_str().bold()));
+            lines.push(Line::from(""));
+            lines.push(Line::from(
+                match self.connection {
+                    Connection::Lost => "connection lost, retrying…",
+                    _ => "connecting…",
+                }
+                .dim(),
+            ));
+            return lines;
+        }
         if !self.playing() {
             lines.push(Line::from(self.name.as_str().bold()));
             lines.push(Line::from(""));
@@ -190,7 +256,7 @@ impl NowPlaying {
     fn status(&self) -> String {
         let mut parts = vec![self.name.clone()];
         if let Some(session) = &self.session {
-            parts.push(session.peer.to_string());
+            parts.push(session.peer.clone());
             parts.push(format!("{} Hz {}ch", session.rate, session.channels));
         }
         if let Some(db) = self.volume_db {
@@ -216,6 +282,25 @@ impl NowPlaying {
             text_area,
         );
         artwork_area
+    }
+}
+
+/// Decode base64 artwork from the wire. Empty data is the sender's clear;
+/// undecodable data is treated the same way, since a broken image is not
+/// worth failing a display over.
+fn decode_artwork(content_type: &str, data_base64: &str) -> Option<Artwork> {
+    if data_base64.is_empty() {
+        return None;
+    }
+    match STANDARD.decode(data_base64) {
+        Ok(data) => Some(Artwork {
+            content_type: content_type.to_string(),
+            data,
+        }),
+        Err(e) => {
+            log::warn!("ignoring undecodable artwork: {e}");
+            None
+        }
     }
 }
 
@@ -299,7 +384,7 @@ fn clock(d: Duration) -> String {
 pub enum Exit {
     /// The user asked to quit (`q`, `Esc`, or `Ctrl-C`).
     Quit,
-    /// The receiver dropped the event channel.
+    /// The client task stopped, so there is nothing left to display.
     Disconnected,
 }
 
@@ -394,8 +479,8 @@ fn draw_artwork(
 /// and the alternate screen and installs a panic hook that restores them;
 /// [`TerminalGuard`] covers every other way out.
 pub async fn run(
-    mut events: UnboundedReceiver<Event>,
-    name: String,
+    mut updates: UnboundedReceiver<Update>,
+    endpoint: String,
     images: Protocol,
 ) -> std::io::Result<Exit> {
     // Cell size has to be read before ratatui takes the terminal over; it
@@ -403,17 +488,17 @@ pub async fn run(
     let cell_aspect = images::cell_aspect();
     let mut terminal = ratatui::try_init()?;
     let _guard = TerminalGuard { images };
-    event_loop(&mut terminal, &mut events, name, images, cell_aspect).await
+    event_loop(&mut terminal, &mut updates, endpoint, images, cell_aspect).await
 }
 
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
-    events: &mut UnboundedReceiver<Event>,
-    name: String,
+    updates: &mut UnboundedReceiver<Update>,
+    endpoint: String,
     images: Protocol,
     cell_aspect: f32,
 ) -> std::io::Result<Exit> {
-    let mut state = NowPlaying::new(name);
+    let mut state = NowPlaying::new(endpoint);
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
     // Raw mode means the terminal sends no SIGINT, but `kill` and systemd
@@ -429,9 +514,9 @@ async fn event_loop(
         draw_artwork(images, &state, box_area, &mut drawn)?;
 
         tokio::select! {
-            // The receiver's events: the display state.
-            event = events.recv() => match event {
-                Some(event) => state.apply(event),
+            // The receiver's messages: the display state.
+            update = updates.recv() => match update {
+                Some(update) => state.apply(update),
                 None => return Ok(Exit::Disconnected),
             },
             // Keys and resizes. In raw mode Ctrl-C is a key, not a signal.
@@ -459,7 +544,6 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
-    use std::net::Ipv4Addr;
 
     fn draw(state: &NowPlaying, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -481,20 +565,42 @@ mod tests {
             .join("\n")
     }
 
+    /// A connected dashboard with a track playing, built the way a real one
+    /// is: a snapshot on connect, then changes.
     fn playing() -> NowPlaying {
-        let mut state = NowPlaying::new("Living Room".into());
-        state.apply(Event::SessionStarted {
+        let mut state = connected();
+        state.apply(msg(Message::SessionStarted {
             rate: 44100,
             channels: 2,
-            peer: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)),
-        });
-        state.apply(Event::Metadata {
+            peer: "192.168.1.42".into(),
+        }));
+        state.apply(msg(Message::Metadata {
             title: Some("Sonata No. 1".into()),
             artist: Some("Some Artist".into()),
             album: Some("Some Album".into()),
-        });
-        state.apply(Event::Volume { db: -12.5 });
+        }));
+        state.apply(msg(Message::Volume { db: -12.5 }));
         state
+    }
+
+    /// Connected, with the receiver's snapshot but nothing playing.
+    fn connected() -> NowPlaying {
+        let mut state = NowPlaying::new("ws://127.0.0.1:7392".into());
+        state.apply(Update::Connected);
+        state.apply(msg(Message::Snapshot(
+            openairplay1_dashboard_protocol::Snapshot {
+                receiver: openairplay1_dashboard_protocol::ReceiverInfo {
+                    name: "Living Room".into(),
+                    version: "0.2.0".into(),
+                },
+                ..Default::default()
+            },
+        )));
+        state
+    }
+
+    fn msg(message: Message) -> Update {
+        Update::Message(Box::new(message))
     }
 
     /// Every rendered line is centered within the screen width.
@@ -511,11 +617,99 @@ mod tests {
 
     #[test]
     fn idle_screen_names_the_receiver() {
-        let state = NowPlaying::new("Living Room".into());
+        let state = connected();
         let screen = draw(&state, 40, 10);
         assert!(screen.contains("Living Room"), "{screen}");
         assert!(screen.contains("waiting for a sender"), "{screen}");
         assert_centered(&screen, 40);
+    }
+
+    #[test]
+    fn before_a_receiver_answers_the_screen_says_so() {
+        // A stale screen must never be mistaken for live state, so the
+        // connection state replaces the track entirely.
+        let state = NowPlaying::new("ws://127.0.0.1:7392".into());
+        let screen = draw(&state, 44, 10);
+        assert!(screen.contains("ws://127.0.0.1:7392"), "{screen}");
+        assert!(screen.contains("connecting"), "{screen}");
+        assert_centered(&screen, 44);
+    }
+
+    #[test]
+    fn losing_the_receiver_is_shown_and_stops_the_clock() {
+        let mut state = playing();
+        state.apply(msg(Message::Progress {
+            elapsed_ms: 1_000,
+            duration_ms: 2_000,
+        }));
+        state.apply(Update::Disconnected);
+        let screen = draw(&state, 44, 12);
+        assert!(screen.contains("connection lost, retrying"), "{screen}");
+        assert!(
+            !screen.contains("0:01 / 0:02"),
+            "the clock must stop: {screen}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_fills_the_screen_in_one_go() {
+        // What a dashboard started mid-track gets: everything at once.
+        use openairplay1_dashboard_protocol as proto;
+        let mut state = NowPlaying::new("ws://host:7392".into());
+        state.apply(Update::Connected);
+        state.apply(msg(Message::Snapshot(proto::Snapshot {
+            receiver: proto::ReceiverInfo {
+                name: "Living Room".into(),
+                version: "0.2.0".into(),
+            },
+            session: Some(proto::SessionInfo {
+                rate: 44100,
+                channels: 2,
+                peer: "192.168.1.42".into(),
+            }),
+            track: Some(proto::Track {
+                title: Some("Sonata No. 1".into()),
+                artist: Some("Some Artist".into()),
+                album: None,
+            }),
+            volume_db: Some(-12.5),
+            progress: Some(proto::Progress {
+                elapsed_ms: 83_000,
+                duration_ms: 247_000,
+            }),
+            artwork: Some(proto::Artwork {
+                content_type: "image/jpeg".into(),
+                data_base64: STANDARD.encode([1, 2, 3]),
+            }),
+        })));
+
+        let screen = draw(&state, 60, 20);
+        assert!(screen.contains("Sonata No. 1"), "{screen}");
+        assert!(screen.contains("Some Artist"), "{screen}");
+        assert!(screen.contains("1:23 / 4:07"), "{screen}");
+        assert!(
+            screen.contains("Living Room · 192.168.1.42 · 44100 Hz 2ch · -12.5 dB"),
+            "{screen}"
+        );
+        assert_eq!(
+            state.artwork.as_ref().map(|a| a.data.clone()),
+            Some(vec![1, 2, 3]),
+            "artwork is decoded from base64"
+        );
+    }
+
+    #[test]
+    fn undecodable_artwork_is_dropped_not_fatal() {
+        let mut state = playing();
+        state.apply(msg(Message::Artwork {
+            content_type: "image/jpeg".into(),
+            data_base64: "not base64!!".into(),
+        }));
+        assert!(state.artwork.is_none());
+        assert!(
+            draw(&state, 40, 12).contains("Sonata"),
+            "the screen survives"
+        );
     }
 
     #[test]
@@ -534,10 +728,10 @@ mod tests {
     #[test]
     fn progress_is_shown_as_a_bar_and_a_clock() {
         let mut state = playing();
-        state.apply(Event::Progress {
-            elapsed: Duration::from_secs(83),
-            duration: Duration::from_secs(247),
-        });
+        state.apply(msg(Message::Progress {
+            elapsed_ms: 83_000,
+            duration_ms: 247_000,
+        }));
         let screen = draw(&state, 60, 20);
         assert!(screen.contains("1:23 / 4:07"), "{screen}");
         assert!(screen.contains('━') && screen.contains('─'), "{screen}");
@@ -546,10 +740,10 @@ mod tests {
     #[test]
     fn a_stream_with_no_known_end_shows_no_clock() {
         let mut state = playing();
-        state.apply(Event::Progress {
-            elapsed: Duration::from_secs(10),
-            duration: Duration::ZERO,
-        });
+        state.apply(msg(Message::Progress {
+            elapsed_ms: 10_000,
+            duration_ms: 0,
+        }));
         let screen = draw(&state, 60, 20);
         assert!(!screen.contains('/'), "{screen}");
     }
@@ -557,11 +751,11 @@ mod tests {
     #[test]
     fn missing_metadata_fields_are_skipped_not_blanked() {
         let mut state = playing();
-        state.apply(Event::Metadata {
+        state.apply(msg(Message::Metadata {
             title: Some("Just A Title".into()),
             artist: None,
             album: None,
-        });
+        }));
         let screen = draw(&state, 40, 12);
         assert!(screen.contains("Just A Title"), "{screen}");
         assert!(!screen.contains("Some Artist"), "{screen}");
@@ -570,7 +764,7 @@ mod tests {
     #[test]
     fn session_end_returns_to_idle() {
         let mut state = playing();
-        state.apply(Event::SessionEnded);
+        state.apply(msg(Message::SessionEnded));
         let screen = draw(&state, 40, 10);
         assert!(screen.contains("waiting for a sender"), "{screen}");
         assert!(!screen.contains("Sonata"), "{screen}");
@@ -608,15 +802,15 @@ mod tests {
     #[test]
     fn empty_artwork_clears_it() {
         let mut state = playing();
-        state.apply(Event::Artwork {
+        state.apply(msg(Message::Artwork {
             content_type: "image/jpeg".into(),
-            data: vec![1, 2, 3],
-        });
+            data_base64: STANDARD.encode([1, 2, 3]),
+        }));
         assert!(state.artwork.is_some());
-        state.apply(Event::Artwork {
+        state.apply(msg(Message::Artwork {
             content_type: "image/none".into(),
-            data: Vec::new(),
-        });
+            data_base64: String::new(),
+        }));
         assert!(state.artwork.is_none(), "image/none must clear the art");
     }
 
