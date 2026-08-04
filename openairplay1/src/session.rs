@@ -58,17 +58,22 @@ impl Drop for SlotGuard {
     }
 }
 
-/// A decrypted audio packet, surfaced to an optional observer. Milestone 2
-/// uses this to prove the crypto path in tests and logs; milestone 3 will
-/// feed it to the ALAC decoder.
+/// A decrypted audio packet, surfaced to an optional observer (the
+/// integration tests use it to prove the crypto path; production passes no
+/// observer).
 #[derive(Debug, Clone)]
 pub struct DecryptedAudio {
+    /// RTP sequence number of the packet.
     pub sequence: u16,
+    /// RTP timestamp (derived from the first packet's anchor).
     pub timestamp: u32,
+    /// Whether the plaintext passes a basic ALAC stereo sanity check.
     pub looks_like_alac: bool,
+    /// The decrypted ALAC frame, exactly as carried in the RTP payload.
     pub frame: Vec<u8>,
 }
 
+/// The receiving end of the decrypted-audio observation channel.
 pub type AudioObserver = tokio::sync::mpsc::UnboundedSender<DecryptedAudio>;
 
 /// Cryptographic and format parameters captured at ANNOUNCE.

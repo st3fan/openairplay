@@ -16,8 +16,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 use openairplay1::server::{self, Context};
-use openairplay1::session::DecryptedAudio;
-use openairplay1::sink::AudioSink;
+use openairplay1::AudioSink;
+use openairplay1::DecryptedAudio;
 use openairplay1::{crypto, Config};
 
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;

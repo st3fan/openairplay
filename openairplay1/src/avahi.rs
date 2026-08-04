@@ -5,7 +5,7 @@
 //! registration is tied to our own connection, so it's published for exactly
 //! as long as the [`Advertisement`] (and thus the receiver) lives.
 
-use log::{info, warn};
+use log::info;
 use zbus::zvariant::OwnedObjectPath;
 use zbus::Connection;
 
@@ -131,24 +131,4 @@ async fn server_version(connection: &Connection) -> zbus::Result<String> {
         .await?
         .body()
         .deserialize()
-}
-
-/// Explicitly free the registration before dropping (best-effort). Dropping
-/// the connection alone also withdraws it, but this makes withdrawal prompt.
-impl Advertisement {
-    pub async fn withdraw(self) {
-        if let Err(e) = self
-            ._connection
-            .call_method(
-                Some(AVAHI_DEST),
-                &self._group,
-                Some(GROUP_IFACE),
-                "Free",
-                &(),
-            )
-            .await
-        {
-            warn!("failed to free Avahi entry group: {e}");
-        }
-    }
 }

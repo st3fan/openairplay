@@ -9,9 +9,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 use openairplay1::server::{self, Context};
-use openairplay1::session::DecryptedAudio;
-use openairplay1::sink::AudioSink;
+use openairplay1::AudioSink;
 use openairplay1::Config;
+use openairplay1::DecryptedAudio;
 
 /// Tests never touch audio hardware: the sink discards everything.
 struct Discard;

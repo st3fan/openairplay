@@ -15,7 +15,7 @@ use alsa::pcm::{Access, Format, HwParams, State, PCM};
 use alsa::{Direction, ValueOr};
 use log::{debug, info, warn};
 
-use openairplay1::sink::AudioSink;
+use openairplay1::AudioSink;
 
 /// The `SET_PARAMETER` mute sentinel.
 const MUTE_DB: f32 = -144.0;
