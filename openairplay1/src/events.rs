@@ -17,9 +17,10 @@ use std::time::Duration;
 pub enum Event {
     /// `SETUP` completed; a sink is about to be created and used.
     ///
-    /// Marked `#[non_exhaustive]`: match it with `..` so later fields don't
-    /// break your code.
-    #[non_exhaustive]
+    /// Deliberately *not* `#[non_exhaustive]`: hosts build this variant in
+    /// their own tests (the receiver's TUI tests do), and a non-exhaustive
+    /// variant cannot be constructed outside this crate. Matching with `..`
+    /// is still the friendlier habit.
     SessionStarted {
         /// Sample rate in Hz (44100 for every stock sender).
         rate: u32,

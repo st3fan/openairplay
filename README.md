@@ -111,9 +111,25 @@ RUST_LOG=debug ./target/release/openairplay1-receiver
 | `--alsa-device DEV` | `default` | ALSA output device |
 | `--no-audio` | — | Decode only; don't open an audio device |
 | `--no-avahi` | — | Don't advertise the service |
+| `--tui` | — | Full-screen now-playing display instead of log output |
+| `--log-file PATH` | — | Write the log to a file (required to keep logs under `--tui`) |
 
 Logging is controlled by `RUST_LOG` (`error`/`warn`/`info`/`debug`); it
 defaults to `info`.
+
+### Now-playing display
+
+`--tui` takes over the terminal and shows what is currently playing — track
+title, artist and album centered on screen, with the cover art, a progress
+clock, the sender's address, the stream format and the volume. Press `q` (or
+`Ctrl-C`) to quit.
+
+```sh
+./target/release/openairplay1-receiver --name "Living Room" --tui
+```
+
+Log output would corrupt the display, so under `--tui` it is dropped unless
+you point it at a file with `--log-file /tmp/receiver.log`.
 
 ## Embedding
 

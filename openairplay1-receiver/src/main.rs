@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use log::{debug, info};
 
 mod player;
+mod tui;
 
 use crate::player::{volume_to_gain, AlsaSink, NullSink, SharedGain};
 use openairplay1::{AudioSink, Event, Receiver};
@@ -21,12 +22,17 @@ struct Args {
     avahi: bool,
     /// ALSA device, or `None` for `--no-audio`.
     alsa_device: Option<String>,
+    /// Full-screen now-playing display instead of log output.
+    tui: bool,
+    /// Where log output goes; stderr when `None` (and nowhere at all under
+    /// `--tui`, which owns the screen).
+    log_file: Option<String>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: openairplay1-receiver [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
-         [--alsa-device DEV] [--no-audio] [--no-avahi]"
+         [--alsa-device DEV] [--no-audio] [--no-avahi] [--tui] [--log-file PATH]"
     );
     std::process::exit(2);
 }
@@ -48,6 +54,8 @@ fn parse_args() -> Args {
         mac: None,
         avahi: true,
         alsa_device: Some(DEFAULT_ALSA_DEVICE.to_string()),
+        tui: false,
+        log_file: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -70,6 +78,8 @@ fn parse_args() -> Args {
             }
             "--alsa-device" => args.alsa_device = Some(it.next().unwrap_or_else(|| usage())),
             "--no-audio" => args.alsa_device = None,
+            "--tui" => args.tui = true,
+            "--log-file" => args.log_file = Some(it.next().unwrap_or_else(|| usage())),
             "--no-avahi" => args.avahi = false,
             "-h" | "--help" => usage(),
             other => {
@@ -81,10 +91,75 @@ fn parse_args() -> Args {
     args
 }
 
+/// Point the logger at the right sink. `--log-file` wins; otherwise stderr,
+/// except under `--tui`, where stderr would shred the display and the log is
+/// dropped unless the user asked for a file.
+fn init_logging(args: &Args) -> Result<(), String> {
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    match (&args.log_file, args.tui) {
+        (Some(path), _) => {
+            let file = std::fs::File::create(path)
+                .map_err(|e| format!("cannot write log file {path:?}: {e}"))?;
+            builder.target(env_logger::Target::Pipe(Box::new(file)));
+        }
+        (None, true) => {
+            builder.target(env_logger::Target::Pipe(Box::new(std::io::sink())));
+        }
+        (None, false) => {}
+    }
+    builder.init();
+    Ok(())
+}
+
+/// The non-TUI display: one line per event.
+fn log_event(event: Event) {
+    match event {
+        Event::SessionStarted {
+            rate,
+            channels,
+            peer,
+            ..
+        } => info!("session started ({rate} Hz, {channels}ch) from {peer}"),
+        Event::Progress { elapsed, duration } => debug!(
+            "progress {:.0}s / {:.0}s",
+            elapsed.as_secs_f32(),
+            duration.as_secs_f32()
+        ),
+        Event::Metadata {
+            title,
+            artist,
+            album,
+        } => {
+            let unknown = || "?".to_string();
+            info!(
+                "now playing: {} — {} ({})",
+                artist.unwrap_or_else(unknown),
+                title.unwrap_or_else(unknown),
+                album.unwrap_or_else(unknown)
+            );
+        }
+        Event::Artwork { content_type, data } => {
+            if data.is_empty() {
+                info!("artwork cleared ({content_type})");
+            } else {
+                info!("artwork: {content_type}, {} bytes", data.len());
+            }
+        }
+        Event::SessionEnded => info!("session ended"),
+        Event::Flushed => debug!("flushed"),
+        // Volume is logged where the gain is applied.
+        _ => {}
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = parse_args();
+    if let Err(e) = init_logging(&args) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
 
     let mut builder = Receiver::builder().advertise(args.avahi);
     if let Some(name) = args.name {
@@ -128,54 +203,47 @@ async fn main() -> ExitCode {
         }
     };
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Events drive two things: our gain (always) and the display — the log
+    // normally, the TUI when it owns the screen.
+    let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
+    let tui_mode = args.tui;
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
-            match event {
-                Event::Volume { db } => {
-                    debug!("volume {db} dB");
-                    gain.set(volume_to_gain(db));
+            if let Event::Volume { db } = &event {
+                debug!("volume {db} dB");
+                gain.set(volume_to_gain(*db));
+            }
+            if tui_mode {
+                if ui_tx.send(event).is_err() {
+                    break; // the display is gone; nothing left to update
                 }
-                Event::SessionStarted {
-                    rate,
-                    channels,
-                    peer,
-                    ..
-                } => {
-                    info!("session started ({rate} Hz, {channels}ch) from {peer}");
-                }
-                Event::Progress { elapsed, duration } => {
-                    debug!(
-                        "progress {:.0}s / {:.0}s",
-                        elapsed.as_secs_f32(),
-                        duration.as_secs_f32()
-                    );
-                }
-                Event::Metadata {
-                    title,
-                    artist,
-                    album,
-                } => {
-                    let unknown = || "?".to_string();
-                    info!(
-                        "now playing: {} — {} ({})",
-                        artist.unwrap_or_else(unknown),
-                        title.unwrap_or_else(unknown),
-                        album.unwrap_or_else(unknown)
-                    );
-                }
-                Event::Artwork { content_type, data } => {
-                    if data.is_empty() {
-                        info!("artwork cleared ({content_type})");
-                    } else {
-                        info!("artwork: {content_type}, {} bytes", data.len());
-                    }
-                }
-                Event::SessionEnded => info!("session ended"),
-                Event::Flushed => debug!("flushed"),
-                _ => {}
+            } else {
+                log_event(event);
             }
         }
     });
+
+    if args.tui {
+        // Ctrl-C is deliberately not selected on here: the terminal is in
+        // raw mode, so it arrives as a key event inside the TUI, and
+        // cancelling the TUI future from outside would skip its restore.
+        let name = receiver.config().name.clone();
+        tokio::select! {
+            result = receiver.run(sink_factory, event_tx) => {
+                if let Err(e) = result {
+                    eprintln!("server error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            exit = tui::run(ui_rx, name) => {
+                if let Err(e) = exit {
+                    eprintln!("display error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
 
     tokio::select! {
         result = receiver.run(sink_factory, event_tx) => {
