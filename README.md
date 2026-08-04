@@ -186,7 +186,7 @@ factory and an event channel, run it on your tokio runtime.
 
 ```toml
 [dependencies]
-openairplay1 = "0.2"
+openairplay1 = "0.3"
 ```
 
 ```rust,no_run

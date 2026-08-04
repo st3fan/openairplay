@@ -1,6 +1,6 @@
 [package]
 name = "openairplay1-dashboard"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.87"
 description = "Full-screen now-playing display for an openairplay1 receiver"
@@ -11,7 +11,7 @@ keywords = ["airplay", "raop", "dashboard", "tui", "now-playing"]
 categories = ["multimedia::audio", "command-line-utilities"]
 
 [dependencies]
-openairplay1-dashboard-protocol = { version = "0.2.0", path = "../openairplay1-dashboard-protocol" }
+openairplay1-dashboard-protocol = { version = "0.3.0", path = "../openairplay1-dashboard-protocol" }
 base64 = "0.23.0"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 env_logger = "0.11"

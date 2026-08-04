@@ -1,4 +1,4 @@
-# Release: pushing a v* tag publishes the library to crates.io.
+# Release: pushing a v* tag publishes the workspace's crates to crates.io.
 #
 # Authentication is crates.io Trusted Publishing (GitHub OIDC): no API
 # token is stored in the repo. One-time setup and the full release
@@ -22,18 +22,44 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install ALSA headers
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Check the tag matches the workspace version
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "openairplay1") | .version')
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "tag $GITHUB_REF_NAME does not match workspace version $version" >&2
+            exit 1
+          fi
+          echo "releasing $version"
       - name: Test before publishing
         run: cargo test --workspace
       - name: Authenticate with crates.io
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
-      - name: Publish openairplay1
-        run: cargo publish -p openairplay1
+      # Dependency order: the two leaf crates first, then the two that
+      # depend on them — cargo verifies a dependent against the registry,
+      # not the workspace, and waits for the index to catch up.
+      #
+      # Each crate is skipped if that version is already up, which makes a
+      # re-pushed tag safe after a partial failure, and lets a crate that
+      # had to be published by hand (a brand-new crate, which cannot have a
+      # trusted publisher until it exists) pass through untouched.
+      - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-      # cargo waits for the library to be available in the index before
-      # verifying the dependent binary crate.
-      - name: Publish openairplay1-receiver
-        run: cargo publish -p openairplay1-receiver
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "openairplay1") | .version')
+          for crate in openairplay1 openairplay1-dashboard-protocol \
+                       openairplay1-receiver openairplay1-dashboard; do
+            if curl -sfI "https://crates.io/api/v1/crates/$crate/$version/download" \
+                 -o /dev/null; then
+              echo "== $crate $version is already on crates.io, skipping"
+              continue
+            fi
+            echo "== publishing $crate $version"
+            cargo publish -p "$crate"
+          done

@@ -1,6 +1,6 @@
 [package]
 name = "openairplay1"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 # The floor set by our use of u64::is_multiple_of; CI-less repo, tests run
 # on current stable.
