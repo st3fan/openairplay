@@ -90,6 +90,8 @@ session-key decrypt), [sdp.rs](openairplay1/src/sdp.rs) (SDP/`fmtp` → `AlacCon
 [jitter.rs](openairplay1/src/jitter.rs) (sequence-ordered buffer with loss reporting),
 [clock.rs](openairplay1/src/clock.rs) (NTP offset model, sync anchor, `play_time`),
 [decode.rs](openairplay1/src/decode.rs) (ALAC via the `alac` crate),
+[dmap.rs](openairplay1/src/dmap.rs) (DMAP walker for the track metadata a
+sender pushes with `SET_PARAMETER`; the same walker openairplay2 uses),
 [avahi.rs](openairplay1/src/avahi.rs) (`_raop._tcp` registration over the Avahi D-Bus API).
 
 ## Invariants worth knowing before editing
@@ -116,6 +118,12 @@ session-key decrypt), [sdp.rs](openairplay1/src/sdp.rs) (SDP/`fmtp` → `AlacCon
 - **One streaming session at a time** — the `SessionSlot` gate is acquired at SETUP and released
   at TEARDOWN; a second sender gets `453`.
 - **`GET_PARAMETER` must get a 200** (even with an empty body) — some senders abort otherwise.
+- **`SET_PARAMETER` is dispatched on `Content-Type`**: `text/parameters` (volume),
+  `application/x-dmap-tagged` (track metadata), `image/*` (cover art). Metadata is decoration —
+  an unparseable payload is logged and dropped, never an error or a teardown. `Metadata` and
+  `Artwork` reach the host only between `SessionStarted` and `SessionEnded`; anything that
+  arrives earlier is latched and replayed right after `SessionStarted`. Senders only send any
+  of it because the `md=0,1,2` TXT record advertises it — an empty capture starts there.
 
 ## Runbooks
 

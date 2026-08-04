@@ -138,6 +138,26 @@ async fn main() -> ExitCode {
                 Event::SessionStarted { rate, channels } => {
                     info!("session started ({rate} Hz, {channels}ch)");
                 }
+                Event::Metadata {
+                    title,
+                    artist,
+                    album,
+                } => {
+                    let unknown = || "?".to_string();
+                    info!(
+                        "now playing: {} — {} ({})",
+                        artist.unwrap_or_else(unknown),
+                        title.unwrap_or_else(unknown),
+                        album.unwrap_or_else(unknown)
+                    );
+                }
+                Event::Artwork { content_type, data } => {
+                    if data.is_empty() {
+                        info!("artwork cleared ({content_type})");
+                    } else {
+                        info!("artwork: {content_type}, {} bytes", data.len());
+                    }
+                }
                 Event::SessionEnded => info!("session ended"),
                 Event::Flushed => debug!("flushed"),
                 _ => {}

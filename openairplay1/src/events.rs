@@ -25,6 +25,30 @@ pub enum Event {
         /// AirPlay volume in dB: 0 = full scale, −30 ≈ minimum, −144 = mute.
         db: f32,
     },
+    /// `SET_PARAMETER` track metadata (DMAP). A complete statement about
+    /// the current track, not a delta: fields the sender's payload did not
+    /// carry are `None` and replace the previous value. Delivered only
+    /// between [`Event::SessionStarted`] and [`Event::SessionEnded`].
+    Metadata {
+        /// Track title (DMAP `minm`).
+        title: Option<String>,
+        /// Track artist (DAAP `asar`).
+        artist: Option<String>,
+        /// Track album (DAAP `asal`).
+        album: Option<String>,
+    },
+    /// `SET_PARAMETER` cover art, exactly as sent (typically `image/jpeg`
+    /// or `image/png`, tens to hundreds of KB). Empty `data` — the
+    /// `image/none` content type — means the sender cleared the artwork.
+    /// Delivered only between [`Event::SessionStarted`] and
+    /// [`Event::SessionEnded`].
+    Artwork {
+        /// The image media type as sent, e.g. `image/jpeg` or `image/png`
+        /// (`image/none` accompanies a clear).
+        content_type: String,
+        /// The image bytes, exactly as sent; empty means cleared.
+        data: Vec<u8>,
+    },
     /// `FLUSH` (seek/stop from the sender). The library already reset its
     /// jitter buffer/prebuffer and called [`crate::sink::AudioSink::flush`].
     Flushed,
