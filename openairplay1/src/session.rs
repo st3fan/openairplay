@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
-use log::{debug, info, warn};
+use log::{debug, warn};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
@@ -162,7 +162,7 @@ impl Session {
 
         let params = match (sdp.rsaaeskey.as_deref(), sdp.aesiv.as_deref()) {
             (None, None) => {
-                info!("ANNOUNCE: unencrypted stream, {} Hz", alac.sample_rate);
+                debug!("ANNOUNCE: unencrypted stream, {} Hz", alac.sample_rate);
                 StreamParams {
                     encrypted: false,
                     key: [0; 16],
@@ -172,7 +172,7 @@ impl Session {
             }
             (Some(rsaaeskey), Some(aesiv)) => match decrypt_stream_key(rsaaeskey, aesiv) {
                 Ok((key, iv)) => {
-                    info!("ANNOUNCE: encrypted stream, {} Hz", alac.sample_rate);
+                    debug!("ANNOUNCE: encrypted stream, {} Hz", alac.sample_rate);
                     StreamParams {
                         encrypted: true,
                         key,
@@ -241,7 +241,7 @@ impl Session {
         self.local_control_port = control.local_addr().map(|a| a.port()).unwrap_or(0);
         self.local_timing_port = timing.local_addr().map(|a| a.port()).unwrap_or(0);
 
-        info!(
+        debug!(
             "SETUP: client control={control_port} timing={timing_port}; \
              ours audio={} control={} timing={}",
             self.local_audio_port, self.local_control_port, self.local_timing_port
@@ -318,7 +318,7 @@ impl Session {
                 .split(';')
                 .find_map(|kv| kv.trim().strip_prefix("rtptime="))
                 .and_then(|v| v.parse::<u32>().ok());
-            info!("RECORD: initial seq={seq:?} rtptime={rtptime:?}");
+            debug!("RECORD: initial seq={seq:?} rtptime={rtptime:?}");
         }
         Response::ok().header("Audio-Latency", "11025")
     }
@@ -333,7 +333,7 @@ impl Session {
                 self.flush_tx = None;
                 self.slot_guard = None; // release the streaming slot immediately
                 self.end_session();
-                info!("TEARDOWN: session closed");
+                debug!("TEARDOWN: session closed");
                 Some(Response::ok())
             }
             "FLUSH" => {
@@ -617,7 +617,7 @@ async fn audio_receiver(
                     packet.payload.to_vec()
                 };
                 if received <= 3 || received.is_multiple_of(250) {
-                    info!(
+                    debug!(
                         "audio: {received} pkts, seq={} ts={} {} bytes",
                         packet.sequence, packet.timestamp, frame.len()
                     );

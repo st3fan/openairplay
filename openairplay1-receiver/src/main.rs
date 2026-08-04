@@ -106,7 +106,9 @@ fn init_logging(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-/// The non-TUI display: one line per event.
+/// One line per event, at debug: with a sender streaming these arrive
+/// several times a second, and the receiver's `info` log is meant to stay
+/// readable — the dashboard is where now-playing detail belongs.
 fn log_event(event: Event) {
     match event {
         Event::SessionStarted {
@@ -114,7 +116,7 @@ fn log_event(event: Event) {
             channels,
             peer,
             ..
-        } => info!("session started ({rate} Hz, {channels}ch) from {peer}"),
+        } => debug!("session started ({rate} Hz, {channels}ch) from {peer}"),
         Event::Progress { elapsed, duration } => debug!(
             "progress {:.0}s / {:.0}s",
             elapsed.as_secs_f32(),
@@ -126,7 +128,7 @@ fn log_event(event: Event) {
             album,
         } => {
             let unknown = || "?".to_string();
-            info!(
+            debug!(
                 "now playing: {} — {} ({})",
                 artist.unwrap_or_else(unknown),
                 title.unwrap_or_else(unknown),
@@ -135,12 +137,12 @@ fn log_event(event: Event) {
         }
         Event::Artwork { content_type, data } => {
             if data.is_empty() {
-                info!("artwork cleared ({content_type})");
+                debug!("artwork cleared ({content_type})");
             } else {
-                info!("artwork: {content_type}, {} bytes", data.len());
+                debug!("artwork: {content_type}, {} bytes", data.len());
             }
         }
-        Event::SessionEnded => info!("session ended"),
+        Event::SessionEnded => debug!("session ended"),
         Event::Flushed => debug!("flushed"),
         // Volume is logged where the gain is applied.
         _ => {}

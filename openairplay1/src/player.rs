@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use log::{debug, info, warn};
+use log::{debug, warn};
 
 use crate::clock::{self, ClockModel};
 use crate::decode::AlacDecoder;
@@ -148,7 +148,7 @@ fn run(
     };
 
     let channels = decoder.channels();
-    info!(
+    debug!(
         "player: {} Hz {}ch, prebuffer {prebuffer_packets} packets",
         config.sample_rate, channels
     );
@@ -236,19 +236,19 @@ impl Playout {
         };
         let target = self.clock.lock().unwrap().play_time(first_ts);
         let Some(target) = target else {
-            info!("player: start via prebuffer (no clock sync yet)");
+            debug!("player: start via prebuffer (no clock sync yet)");
             return;
         };
         let now = clock::now_ns();
         if target > now {
             let wait = (target - now).min(2_000_000_000); // cap the wait at 2 s
-            info!(
+            debug!(
                 "player: latency-correct start, waiting {} ms",
                 wait / 1_000_000
             );
             std::thread::sleep(Duration::from_nanos(wait));
         } else {
-            info!("player: latency-correct start (already due, no wait)");
+            debug!("player: latency-correct start (already due, no wait)");
         }
     }
 

@@ -22,7 +22,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
-use log::{debug, info, warn};
+use log::{debug, warn};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -137,11 +137,11 @@ pub async fn serve(listener: TcpListener, publisher: Publisher) -> std::io::Resu
         let (stream, peer) = listener.accept().await?;
         let publisher = publisher.clone();
         tokio::spawn(async move {
-            info!("dashboard [{peer}] connected");
+            debug!("dashboard [{peer}] connected");
             if let Err(e) = serve_client(stream, peer, publisher).await {
                 debug!("dashboard [{peer}] ended: {e}");
             }
-            info!("dashboard [{peer}] disconnected");
+            debug!("dashboard [{peer}] disconnected");
         });
     }
 }

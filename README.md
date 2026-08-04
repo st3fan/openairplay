@@ -118,7 +118,9 @@ RUST_LOG=debug ./target/release/openairplay1-receiver
 | `--dashboard-listen ADDR` | — | Serve the now-playing WebSocket on `ADDR` (e.g. `127.0.0.1:7392`) |
 
 Logging is controlled by `RUST_LOG` (`error`/`warn`/`info`/`debug`); it
-defaults to `info`.
+defaults to `info`, which is startup and problems only — everything that
+happens because music is playing (RTSP requests, packet counters, track
+changes) is at `debug`, so a long-running receiver stays quiet.
 
 ## Now-playing display
 

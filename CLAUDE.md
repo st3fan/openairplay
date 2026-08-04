@@ -68,7 +68,9 @@ RUST_LOG=debug ./target/release/openairplay1-receiver --name "Living Room" --als
 ```
 
 `RUST_LOG=debug` logs every RTSP request head and body — the way to see what a real sender
-actually sends. `--no-audio` decodes without opening ALSA; `--no-avahi` skips advertising. Full
+actually sends. **`info` is startup and problems only**: anything that fires because music is
+playing (per-request lines, packet counters, session and track changes) belongs at `debug`, so
+a receiver left running doesn't fill a disk. Keep new logging on that side of the line. `--no-audio` decodes without opening ALSA; `--no-avahi` skips advertising. Full
 option list is in the [README](README.md).
 
 ## Architecture

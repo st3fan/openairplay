@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
@@ -31,6 +31,14 @@ use openairplay1_dashboard_protocol::{Message, Snapshot};
 /// How often the screen redraws while a track plays, so the elapsed clock
 /// advances between the sender's (infrequent) progress updates.
 const TICK: Duration = Duration::from_millis(500);
+
+/// The played part of the progress bar. Cyan reads clearly on both light and
+/// dark terminal themes, and comes from the user's own palette rather than a
+/// hard-coded RGB that might clash with it.
+const PLAYED_COLOR: Color = Color::Cyan;
+/// The part still to play: the dimmest colour that is still a colour, so the
+/// contrast with the played part carries the meaning.
+const REMAINING_COLOR: Color = Color::DarkGray;
 
 /// The stream's format and where it came from, known from `SessionStarted`.
 #[derive(Debug, Clone, PartialEq)]
@@ -234,11 +242,7 @@ impl NowPlaying {
 
         if let Some((elapsed, duration)) = self.position() {
             lines.push(Line::from(""));
-            lines.push(Line::from(progress_bar(
-                elapsed,
-                duration,
-                bar_width(width),
-            )));
+            lines.push(progress_bar(elapsed, duration, bar_width(width)));
             lines.push(Line::from(
                 format!("{} / {}", clock(elapsed), clock(duration)).dim(),
             ));
@@ -357,16 +361,30 @@ fn bar_width(screen: u16) -> u16 {
 }
 
 /// `━━━━━━━──────────` — filled proportionally to `elapsed / duration`.
-fn progress_bar(elapsed: Duration, duration: Duration, width: u16) -> String {
+///
+/// The two halves are told apart by **colour** first: heavy-vs-light line
+/// glyphs alone are nearly invisible at a glance, which is what this looked
+/// like before. The glyphs still differ so the bar keeps working on a
+/// terminal with no colour at all.
+fn progress_bar(elapsed: Duration, duration: Duration, width: u16) -> Line<'static> {
     let ratio = if duration.is_zero() {
         0.0
     } else {
         (elapsed.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0)
     };
     let filled = (ratio * width as f64).round() as usize;
-    let mut bar = "━".repeat(filled);
-    bar.push_str(&"─".repeat(width as usize - filled));
-    bar
+    Line::from(vec![
+        Span::styled(
+            "━".repeat(filled),
+            Style::default()
+                .fg(PLAYED_COLOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "─".repeat(width as usize - filled),
+            Style::default().fg(REMAINING_COLOR),
+        ),
+    ])
 }
 
 /// `1:23`, or `1:02:03` once past an hour.
@@ -823,23 +841,80 @@ mod tests {
 
     #[test]
     fn the_progress_bar_fills_proportionally() {
+        /// The bar as (text, colour) pairs, which is what the screen shows.
+        fn parts(elapsed: u64, total: u64, width: u16) -> Vec<(String, Option<Color>)> {
+            progress_bar(
+                Duration::from_secs(elapsed),
+                Duration::from_secs(total),
+                width,
+            )
+            .spans
+            .iter()
+            .map(|span| (span.content.to_string(), span.style.fg))
+            .collect()
+        }
+
         assert_eq!(
-            progress_bar(Duration::ZERO, Duration::from_secs(10), 10),
-            "──────────"
+            parts(0, 10, 10),
+            vec![
+                (String::new(), Some(PLAYED_COLOR)),
+                ("──────────".into(), Some(REMAINING_COLOR)),
+            ]
         );
         assert_eq!(
-            progress_bar(Duration::from_secs(5), Duration::from_secs(10), 10),
-            "━━━━━─────"
+            parts(5, 10, 10),
+            vec![
+                ("━━━━━".into(), Some(PLAYED_COLOR)),
+                ("─────".into(), Some(REMAINING_COLOR)),
+            ]
         );
         assert_eq!(
-            progress_bar(Duration::from_secs(10), Duration::from_secs(10), 10),
-            "━━━━━━━━━━"
+            parts(10, 10, 10),
+            vec![
+                ("━━━━━━━━━━".into(), Some(PLAYED_COLOR)),
+                (String::new(), Some(REMAINING_COLOR)),
+            ]
         );
         // A position past the end (a seek report we haven't caught up with)
         // must not overflow the bar.
-        assert_eq!(
-            progress_bar(Duration::from_secs(99), Duration::from_secs(10), 10),
-            "━━━━━━━━━━"
+        assert_eq!(parts(99, 10, 10)[0].0.chars().count(), 10);
+    }
+
+    #[test]
+    fn the_two_halves_of_the_bar_are_different_colours() {
+        // The whole point: heavy-vs-light glyphs alone were near-invisible,
+        // so the colours must actually differ where the bar is drawn.
+        let mut state = playing();
+        state.apply(msg(Message::Progress {
+            elapsed_ms: 50_000,
+            duration_ms: 100_000,
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                state.render(frame, images::DEFAULT_CELL_ASPECT);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let colours: Vec<_> = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| matches!(buffer[(x, y)].symbol(), "━" | "─"))
+            .map(|(x, y)| (buffer[(x, y)].symbol().to_string(), buffer[(x, y)].fg))
+            .collect();
+        assert!(!colours.is_empty(), "the bar should be on screen");
+        assert!(
+            colours
+                .iter()
+                .any(|(s, fg)| s == "━" && *fg == PLAYED_COLOR),
+            "played part must use the played colour: {colours:?}"
         );
+        assert!(
+            colours
+                .iter()
+                .any(|(s, fg)| s == "─" && *fg == REMAINING_COLOR),
+            "remaining part must use the remaining colour: {colours:?}"
+        );
+        assert_ne!(PLAYED_COLOR, REMAINING_COLOR);
     }
 }
