@@ -256,6 +256,7 @@ impl Session {
         self.send_event(Event::SessionStarted {
             rate: params.alac.sample_rate,
             channels: params.alac.channels,
+            peer: self.peer_ip,
         });
         self.streaming = true;
         // Replay metadata/artwork that arrived before the session started,
@@ -376,18 +377,51 @@ impl Session {
         }
     }
 
-    /// The `text/parameters` flavor — currently just the volume line. The
-    /// library does not apply gain; the host owns that path.
+    /// The `text/parameters` flavor: the volume line and the playback
+    /// position. The library does not apply gain; the host owns that path.
     fn set_text_parameters(&mut self, body: &[u8]) {
         let text = String::from_utf8_lossy(body);
         for line in text.lines() {
-            if let Some(v) = line.trim().strip_prefix("volume:") {
+            let line = line.trim();
+            if let Some(v) = line.strip_prefix("volume:") {
                 if let Ok(db) = v.trim().parse::<f32>() {
                     debug!("SET_PARAMETER volume {db} dB");
                     self.send_event(Event::Volume { db });
                 }
+            } else if let Some(v) = line.strip_prefix("progress:") {
+                self.set_progress(v.trim());
             }
         }
+    }
+
+    /// `progress: <start>/<current>/<end>` — three RTP timestamps. Converted
+    /// to durations with the stream's sample rate so no wire concept reaches
+    /// the host; reported only while a session is running, since a position
+    /// without a stream means nothing.
+    fn set_progress(&mut self, value: &str) {
+        let Some(params) = &self.params else { return };
+        if !self.streaming {
+            return;
+        }
+        let rate = params.alac.sample_rate;
+        let mut parts = value.split('/').map(|p| p.trim().parse::<u32>());
+        let (Some(Ok(start)), Some(Ok(current)), Some(Ok(end)), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            debug!("SET_PARAMETER progress: unparseable value {value:?}");
+            return;
+        };
+        // RTP timestamps wrap and a seek can put `current` before `start`;
+        // saturating subtraction keeps both readings sane rather than
+        // reporting a position of ~27 hours.
+        let elapsed = frames_to_duration(current.saturating_sub(start), rate);
+        let duration = frames_to_duration(end.saturating_sub(start), rate);
+        debug!(
+            "SET_PARAMETER progress {:.1}s / {:.1}s",
+            elapsed.as_secs_f32(),
+            duration.as_secs_f32()
+        );
+        self.send_event(Event::Progress { elapsed, duration });
     }
 
     /// DMAP track metadata. Metadata is decoration: an unparseable payload
@@ -460,6 +494,14 @@ impl Drop for Session {
         self.stop_tasks();
         self.end_session();
     }
+}
+
+/// Convert a frame count at `rate` Hz to a wall-clock duration.
+fn frames_to_duration(frames: u32, rate: u32) -> Duration {
+    if rate == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64(frames as f64 / rate as f64)
 }
 
 /// Decrypt the AES key (RSA-OAEP) and decode the IV (base64, 16 bytes).
@@ -853,7 +895,8 @@ mod tests {
             events.try_recv(),
             Ok(Event::SessionStarted {
                 rate: 44100,
-                channels: 2
+                channels: 2,
+                peer: IpAddr::V4(Ipv4Addr::LOCALHOST),
             })
         );
 
@@ -903,7 +946,8 @@ mod tests {
             events.try_recv(),
             Ok(Event::SessionStarted {
                 rate: 44100,
-                channels: 2
+                channels: 2,
+                peer: IpAddr::V4(Ipv4Addr::LOCALHOST),
             })
         );
 
@@ -956,7 +1000,8 @@ mod tests {
             events.try_recv(),
             Ok(Event::SessionStarted {
                 rate: 44100,
-                channels: 2
+                channels: 2,
+                peer: IpAddr::V4(Ipv4Addr::LOCALHOST),
             })
         );
     }
@@ -1005,6 +1050,79 @@ mod tests {
         // Anything else is acknowledged but produces no event.
         session.set_parameter(Some("application/octet-stream"), b"\x00\x01");
         assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn progress_is_reported_as_durations() {
+        let (mut session, mut events) = session();
+        start_session(&mut session, &mut events).await;
+
+        // start/current/end as RTP timestamps at 44100 Hz: 10 s in, 180 s
+        // long. Senders send this line on its own or next to the volume.
+        session.set_parameter(
+            Some("text/parameters"),
+            b"progress: 1000/442000/7939000\r\n",
+        );
+        let Ok(Event::Progress { elapsed, duration }) = events.try_recv() else {
+            panic!("expected a Progress event");
+        };
+        assert!(
+            (elapsed.as_secs_f64() - 10.0).abs() < 0.01,
+            "elapsed was {elapsed:?}"
+        );
+        assert!(
+            (duration.as_secs_f64() - 180.0).abs() < 0.01,
+            "duration was {duration:?}"
+        );
+
+        // A seek backwards past the anchor, and a stream with no known end,
+        // must not produce a ~27-hour reading from a wrapped subtraction.
+        session.set_parameter(Some("text/parameters"), b"progress: 5000/1000/5000");
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::Progress {
+                elapsed: Duration::ZERO,
+                duration: Duration::ZERO,
+            })
+        );
+
+        // Malformed values are ignored, and the volume line in the same body
+        // still works.
+        for bad in [
+            "progress: 1/2\r\n",
+            "progress: 1/2/3/4\r\n",
+            "progress: a/b/c\r\n",
+            "progress:\r\n",
+        ] {
+            session.set_parameter(Some("text/parameters"), bad.as_bytes());
+        }
+        assert!(events.try_recv().is_err(), "no event from bad progress");
+
+        session.set_parameter(
+            Some("text/parameters"),
+            b"volume: -8.0\r\nprogress: 1000/45100/7939000\r\n",
+        );
+        assert_eq!(events.try_recv(), Ok(Event::Volume { db: -8.0 }));
+        assert!(matches!(events.try_recv(), Ok(Event::Progress { .. })));
+    }
+
+    #[tokio::test]
+    async fn progress_outside_a_session_is_dropped() {
+        // A position without a stream means nothing, and before ANNOUNCE
+        // there is no sample rate to convert it with.
+        let (mut session, mut events) = session();
+        session.set_parameter(Some("text/parameters"), b"progress: 1000/442000/7939000");
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn session_started_carries_the_sender_address() {
+        let (mut session, mut events) = session();
+        start_session(&mut session, &mut events).await; // asserts peer
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

@@ -3,7 +3,11 @@
 //! Sent over an unbounded `tokio::sync::mpsc` channel so the host consumes
 //! them at its own pace; a dropped receiver is tolerated (events are then
 //! discarded). Wire concepts (RTSP, SDP, RTP, sequence numbers) never appear
-//! here.
+//! here — playback position, for instance, arrives on the wire as RTP
+//! timestamps and is reported here as [`Duration`].
+
+use std::net::IpAddr;
+use std::time::Duration;
 
 /// What the host needs to know about the streaming session. Transport
 /// handling (FLUSH) is already done inside the library — that variant is
@@ -12,11 +16,17 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// `SETUP` completed; a sink is about to be created and used.
+    ///
+    /// Marked `#[non_exhaustive]`: match it with `..` so later fields don't
+    /// break your code.
+    #[non_exhaustive]
     SessionStarted {
         /// Sample rate in Hz (44100 for every stock sender).
         rate: u32,
         /// Channel count (2 for every stock sender).
         channels: u8,
+        /// The address the sender connected from.
+        peer: IpAddr,
     },
     /// `SET_PARAMETER volume`, in AirPlay dB (0 = full, −144 = mute). The
     /// library does not apply gain — the host maps this onto its own volume
@@ -48,6 +58,18 @@ pub enum Event {
         content_type: String,
         /// The image bytes, exactly as sent; empty means cleared.
         data: Vec<u8>,
+    },
+    /// `SET_PARAMETER` playback position for the current track. Senders push
+    /// this every few seconds and on every seek, not per frame, so a host
+    /// showing a running clock extrapolates between events and re-syncs on
+    /// each one. Delivered only between [`Event::SessionStarted`] and
+    /// [`Event::SessionEnded`].
+    Progress {
+        /// How far into the track playback is.
+        elapsed: Duration,
+        /// The track's total length. Zero when the sender reports a stream
+        /// with no known end (live radio, for instance).
+        duration: Duration,
     },
     /// `FLUSH` (seek/stop from the sender). The library already reset its
     /// jitter buffer/prebuffer and called [`crate::sink::AudioSink::flush`].

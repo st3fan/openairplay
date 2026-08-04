@@ -122,7 +122,7 @@ factory and an event channel, run it on your tokio runtime.
 
 ```toml
 [dependencies]
-openairplay1 = "0.1"
+openairplay1 = "0.2"
 ```
 
 ```rust,no_run
@@ -151,11 +151,14 @@ async fn main() -> std::io::Result<()> {
 The library keeps the session semantics (RTSP handshake, decrypt, jitter
 buffer and retransmits, the NTP clock model, ALAC decode, the prebuffer and
 latency-correct start, FLUSH handling); the host sees only PCM and events —
-`SessionStarted`, `Volume` (in AirPlay dB), `Metadata` (track title, artist,
-album), `Artwork` (cover art bytes as sent), `Flushed`, `SessionEnded`.
-`Metadata` and `Artwork` arrive only between `SessionStarted` and
-`SessionEnded`; each `Metadata` is a complete statement about the current
-track, not a delta, and empty `Artwork` data means the sender cleared it. A
+`SessionStarted` (rate, channels, and the sender's address), `Volume` (in
+AirPlay dB), `Metadata` (track title, artist, album), `Artwork` (cover art
+bytes as sent), `Progress` (position and length as `Duration`s), `Flushed`,
+`SessionEnded`. `Metadata`, `Artwork` and `Progress` arrive only between
+`SessionStarted` and `SessionEnded`; each `Metadata` is a complete statement
+about the current track, not a delta, and empty `Artwork` data means the
+sender cleared it. Senders push `Progress` every few seconds rather than per
+frame, so a running clock extrapolates between events. A
 host that owns its mDNS registration builds with `.advertise(false)` and
 publishes `receiver.txt_records()` itself under
 `receiver.config().service_name()`.

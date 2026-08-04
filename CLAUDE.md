@@ -118,7 +118,9 @@ sender pushes with `SET_PARAMETER`; the same walker openairplay2 uses),
 - **One streaming session at a time** — the `SessionSlot` gate is acquired at SETUP and released
   at TEARDOWN; a second sender gets `453`.
 - **`GET_PARAMETER` must get a 200** (even with an empty body) — some senders abort otherwise.
-- **`SET_PARAMETER` is dispatched on `Content-Type`**: `text/parameters` (volume),
+- **`SET_PARAMETER` is dispatched on `Content-Type`**: `text/parameters` (volume and
+  `progress:`, the latter converted to `Duration`s with the stream's sample rate so RTP
+  timestamps stay out of the public API),
   `application/x-dmap-tagged` (track metadata), `image/*` (cover art). Metadata is decoration —
   an unparseable payload is logged and dropped, never an error or a teardown. `Metadata` and
   `Artwork` reach the host only between `SessionStarted` and `SessionEnded`; anything that
