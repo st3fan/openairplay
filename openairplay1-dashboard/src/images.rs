@@ -15,7 +15,7 @@
 //! Everything in this module is a pure function over bytes and placement,
 //! except [`probe_kitty`] and [`cell_size`], which touch the terminal.
 
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD;
@@ -90,42 +90,101 @@ pub fn detect(env: impl Fn(&str) -> Option<String>, probe: Option<bool>) -> Prot
 /// Ask the terminal whether it speaks the Kitty graphics protocol, by
 /// transmitting a 1×1 image with `a=q` and waiting briefly for the reply.
 ///
-/// Must run **before** raw mode is handed to the TUI event loop, and returns
-/// `None` when the answer is inconclusive (no reply in time, or not a
-/// terminal) so [`detect`] can fall back to the environment.
+/// Must run **before** the TUI event loop takes the terminal over, and
+/// returns `None` when the answer is inconclusive (not a terminal, or no
+/// reply at all) so [`detect`] can fall back to the environment.
+///
+/// The reply is read straight from the file descriptor rather than through
+/// crossterm's event machinery: `crossterm::event::poll` parses whatever is
+/// pending into its own buffer, so a subsequent read of stdin finds nothing
+/// on the fd and blocks until the next keystroke. That is not hypothetical —
+/// it made the dashboard render nothing until a key was pressed, on exactly
+/// the terminals that answer the query.
 pub fn probe_kitty(timeout: Duration) -> Option<bool> {
-    if !io::IsTerminal::is_terminal(&io::stdout()) {
+    if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
         return None;
     }
     let _raw = RawMode::enable().ok()?;
+
+    // The graphics query, then a Device Attributes request. Every terminal
+    // answers DA1, so its reply marks the end of the answer — without it we
+    // would wait out the whole timeout on terminals that ignore the first
+    // query, which is a visible pause before the display appears.
     let query = format!(
-        "\x1b_Gi={PROBE_ID},s=1,v=1,a=q,t=d,f=24;{}\x1b\\",
+        "\x1b_Gi={PROBE_ID},s=1,v=1,a=q,t=d,f=24;{}\x1b\\\x1b[c",
         STANDARD.encode([0u8, 0, 0])
     );
     let mut stdout = io::stdout();
     stdout.write_all(query.as_bytes()).ok()?;
     stdout.flush().ok()?;
 
-    // The reply is `\x1b_Gi=<id>;OK\x1b\\`. Anything else — including a
-    // terminal that echoes nothing — leaves this inconclusive.
     let deadline = Instant::now() + timeout;
     let mut reply = Vec::new();
-    let mut byte = [0u8; 1];
-    while Instant::now() < deadline {
-        match read_with_timeout(&mut byte, Duration::from_millis(20)) {
-            Ok(1) => {
-                reply.push(byte[0]);
-                if reply.ends_with(b"\x1b\\") {
-                    break;
-                }
-            }
-            Ok(_) => break,
-            Err(_) => break,
+    while let Some(byte) = read_byte_before(deadline) {
+        reply.push(byte);
+        if ends_with_device_attributes(&reply) {
+            break;
         }
     }
-    let reply = String::from_utf8_lossy(&reply).into_owned();
-    debug!("kitty graphics probe reply: {reply:?}");
-    reply.contains(&format!("i={PROBE_ID}")).then_some(true)
+    debug!(
+        "kitty graphics probe reply: {:?}",
+        String::from_utf8_lossy(&reply)
+    );
+    if reply.is_empty() {
+        return None; // said nothing at all: let the environment decide
+    }
+    Some(kitty_supported(&reply))
+}
+
+/// Does this reply contain the graphics protocol's `OK` for our query?
+fn kitty_supported(reply: &[u8]) -> bool {
+    let reply = String::from_utf8_lossy(reply);
+    reply
+        .split("\x1b_G")
+        .skip(1)
+        .any(|answer| answer.contains(&format!("i={PROBE_ID}")) && answer.contains("OK"))
+}
+
+/// Has the Device Attributes answer (`ESC [ ? … c`) arrived? That is the end
+/// of everything the terminal has to say about our queries.
+fn ends_with_device_attributes(reply: &[u8]) -> bool {
+    if !reply.ends_with(b"c") {
+        return false;
+    }
+    let reply = String::from_utf8_lossy(reply);
+    reply
+        .rfind("\x1b[?")
+        .is_some_and(|start| !reply[start..].contains("\x1b\\"))
+}
+
+/// Read one byte from the terminal, giving up at `deadline`. Uses `poll(2)`
+/// on the file descriptor directly — see [`probe_kitty`] for why not
+/// crossterm.
+fn read_byte_before(deadline: Instant) -> Option<u8> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    let mut fds = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one initialized pollfd, and the count matches.
+    let ready = unsafe { libc::poll(&mut fds, 1, remaining.as_millis() as libc::c_int) };
+    if ready <= 0 {
+        return None;
+    }
+    let mut byte = 0u8;
+    // SAFETY: reading one byte into a byte we own.
+    let read = unsafe {
+        libc::read(
+            libc::STDIN_FILENO,
+            std::ptr::addr_of_mut!(byte).cast::<libc::c_void>(),
+            1,
+        )
+    };
+    (read == 1).then_some(byte)
 }
 
 /// Image id for the probe, distinct from the one the display uses.
@@ -307,15 +366,6 @@ impl Drop for RawMode {
     }
 }
 
-/// Read one byte from stdin, giving up after `timeout`.
-fn read_with_timeout(buf: &mut [u8; 1], timeout: Duration) -> io::Result<usize> {
-    if crossterm::event::poll(timeout)? {
-        io::stdin().read(buf)
-    } else {
-        Err(io::Error::new(io::ErrorKind::TimedOut, "no reply"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +431,37 @@ mod tests {
                 "should be None: {env:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_kitty_reply_is_recognized_and_anything_else_is_not() {
+        // What Ghostty/Kitty answer, followed by the DA1 reply.
+        let ok = b"\x1b_Gi=7331;OK\x1b\\\x1b[?62;c";
+        assert!(kitty_supported(ok));
+        // A terminal that only answers DA1 has no graphics support.
+        assert!(!kitty_supported(b"\x1b[?62;c"));
+        // An error answer is not support either.
+        assert!(!kitty_supported(b"\x1b_Gi=7331;ENOTSUPPORTED\x1b\\"));
+        // Somebody else's image id is not our answer.
+        assert!(!kitty_supported(b"\x1b_Gi=99;OK\x1b\\"));
+        assert!(!kitty_supported(b""));
+    }
+
+    #[test]
+    fn the_device_attributes_reply_ends_the_wait() {
+        // Without this the probe waits out its whole timeout on every
+        // terminal that ignores the graphics query — a visible pause before
+        // the display appears.
+        assert!(ends_with_device_attributes(b"\x1b[?62;22c"));
+        assert!(ends_with_device_attributes(
+            b"\x1b_Gi=7331;OK\x1b\\\x1b[?62;22c"
+        ));
+        // Partial replies keep the loop going.
+        assert!(!ends_with_device_attributes(b"\x1b[?62;22"));
+        assert!(!ends_with_device_attributes(b"\x1b_Gi=7331;OK\x1b\\"));
+        // A 'c' inside a graphics answer is not the DA1 terminator.
+        assert!(!ends_with_device_attributes(b"\x1b_Gi=7331;abc\x1b\\"));
+        assert!(!ends_with_device_attributes(b""));
     }
 
     #[test]
