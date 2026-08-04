@@ -1,0 +1,39 @@
+# Release: pushing a v* tag publishes the library to crates.io.
+#
+# Authentication is crates.io Trusted Publishing (GitHub OIDC): no API
+# token is stored in the repo. One-time setup and the full release
+# procedure live in runbooks/releasing.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # for crates.io Trusted Publishing (OIDC)
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ALSA headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Test before publishing
+        run: cargo test --workspace
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish openairplay1
+        run: cargo publish -p openairplay1
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      # cargo waits for the library to be available in the index before
+      # verifying the dependent binary crate.
+      - name: Publish openairplay1-receiver
+        run: cargo publish -p openairplay1-receiver
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

@@ -117,6 +117,14 @@ session-key decrypt), [sdp.rs](openairplay1/src/sdp.rs) (SDP/`fmtp` → `AlacCon
   at TEARDOWN; a second sender gets `453`.
 - **`GET_PARAMETER` must get a 200** (even with an empty body) — some senders abort otherwise.
 
+## Runbooks
+
+Operational procedures live in `runbooks/`. When asked to do a **release**, follow
+[runbooks/releasing.md](runbooks/releasing.md) — tag-driven crates.io publishing via the Release
+workflow, with the failure procedure and the autopilot arrangement. CI
+([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs the workspace on Linux and the
+library on macOS for every PR — the macOS portability deliverable is enforced there.
+
 ## Tests
 
 Unit tests live inline (`#[cfg(test)] mod tests`) next to the code; integration tests in
