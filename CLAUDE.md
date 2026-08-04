@@ -140,6 +140,11 @@ sender pushes with `SET_PARAMETER`; the same walker openairplay2 uses),
   is not knowable to a host.
 - **One streaming session at a time** — the `SessionSlot` gate is acquired at SETUP and released
   at TEARDOWN; a second sender gets `453`.
+- **Playback position follows the audio, not the wall clock.** Senders send `progress:` about
+  once per *track* (a 251-second track played to its end with no further report in one capture),
+  so the position a host displays comes from the RTP timestamp of the audio the player is
+  feeding the sink, against the track extent the sender did give. Pause needs no detection: no
+  audio, no reports, and the last position stands. Don't reintroduce extrapolation anywhere.
 - **`GET_PARAMETER` must get a 200** (even with an empty body) — some senders abort otherwise.
 - **`SET_PARAMETER` is dispatched on `Content-Type`**: `text/parameters` (volume and
   `progress:`, the latter converted to `Duration`s with the stream's sample rate so RTP

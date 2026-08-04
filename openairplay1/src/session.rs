@@ -61,6 +61,20 @@ impl Drop for SlotGuard {
     }
 }
 
+/// The current track's boundaries as RTP timestamps, from the sender's
+/// `progress:` line. Shared with the playback thread, which is the only place
+/// that knows how far into the track the audio actually is.
+pub type TrackAnchor = Arc<Mutex<Option<Track>>>;
+
+/// One track's extent on the RTP timeline.
+#[derive(Debug, Clone, Copy)]
+pub struct Track {
+    /// RTP timestamp where the track starts.
+    pub start: u32,
+    /// RTP timestamp where it ends.
+    pub end: u32,
+}
+
 /// A decrypted audio packet, surfaced to an optional observer (the
 /// integration tests use it to prove the crypto path; production passes no
 /// observer).
@@ -99,6 +113,9 @@ pub struct Session {
     /// True between SETUP and TEARDOWN/drop; guards the one-time
     /// [`Event::SessionEnded`].
     streaming: bool,
+    /// The current track's RTP extent, handed to the playback thread so it
+    /// can report where playback really is.
+    track: TrackAnchor,
     /// Metadata/artwork that arrived while no session was active (senders
     /// may push them earlier in the handshake, before SETUP). The latest of
     /// each is latched here and delivered right after `SessionStarted`, so
@@ -133,6 +150,7 @@ impl Session {
             sink_factory,
             events,
             streaming: false,
+            track: Arc::new(Mutex::new(None)),
             pending_metadata: None,
             pending_artwork: None,
             player: None,
@@ -266,7 +284,13 @@ impl Session {
             self.send_event(event);
         }
         let sink = (self.sink_factory)(params.alac.sample_rate, params.alac.channels);
-        let player = Player::spawn(&params.alac, sink, clock.clone());
+        let player = Player::spawn(
+            &params.alac,
+            sink,
+            clock.clone(),
+            self.events.clone(),
+            self.track.clone(),
+        );
         let player_sender = player.sender();
         self.player = Some(player);
 
@@ -411,6 +435,11 @@ impl Session {
             debug!("SET_PARAMETER progress: unparseable value {value:?}");
             return;
         };
+        // The sender tells us where the track begins and ends on the RTP
+        // timeline; the playback thread turns that into a position that
+        // actually follows the audio.
+        *self.track.lock().unwrap() = Some(Track { start, end });
+
         // RTP timestamps wrap and a seek can put `current` before `start`;
         // saturating subtraction keeps both readings sane rather than
         // reporting a position of ~27 hours.
@@ -476,6 +505,7 @@ impl Session {
 
     /// Report [`Event::SessionEnded`] once per started session.
     fn end_session(&mut self) {
+        *self.track.lock().unwrap() = None;
         if self.streaming {
             self.streaming = false;
             self.send_event(Event::SessionEnded);

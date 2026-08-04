@@ -75,8 +75,10 @@ pub enum Message {
         /// AirPlay volume in dB.
         db: f32,
     },
-    /// Playback position. Senders report this every few seconds rather than
-    /// continuously, so a running clock extrapolates between messages.
+    /// Playback position, reported about once a second while audio plays.
+    /// It follows the audio rather than wall time, so a client displays it
+    /// as-is: when playback pauses the messages stop and the last position
+    /// stands.
     Progress {
         /// How far into the track playback is.
         elapsed_ms: u64,

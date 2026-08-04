@@ -10,7 +10,7 @@
 //! real terminal.
 
 use std::io::Write;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossterm::event::{Event as TermEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
@@ -28,9 +28,9 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use openairplay1_dashboard_protocol::{Message, Snapshot};
 
-/// How often the screen redraws while a track plays, so the elapsed clock
-/// advances between the sender's (infrequent) progress updates.
-const TICK: Duration = Duration::from_millis(500);
+/// A slow heartbeat redraw. The clock no longer needs it — positions arrive
+/// from the receiver — but it keeps the screen honest if anything else drifts.
+const TICK: Duration = Duration::from_secs(1);
 
 /// The played part of the progress bar. Cyan reads clearly on both light and
 /// dark terminal themes, and comes from the user's own palette rather than a
@@ -58,13 +58,16 @@ enum Connection {
     Lost,
 }
 
-/// The last position the sender reported, and when we heard it — the clock
-/// on screen is this extrapolated with the local clock.
-#[derive(Debug, Clone)]
+/// Where playback is, as last reported.
+///
+/// Nothing here is extrapolated: the receiver reports the position from the
+/// audio it is actually playing, about once a second, so the clock advances
+/// because music is playing rather than because time is passing. A sender
+/// that pauses simply stops the reports, and the last one stands.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Progress {
     elapsed: Duration,
     duration: Duration,
-    at: Instant,
 }
 
 /// Cover art exactly as the sender delivered it. Rendering it is the
@@ -115,12 +118,7 @@ impl NowPlaying {
     pub fn apply(&mut self, update: Update) {
         match update {
             Update::Connected => self.connection = Connection::Connected,
-            Update::Disconnected => {
-                self.connection = Connection::Lost;
-                // Keep the last track on screen but stop the clock: without a
-                // receiver we no longer know that it is still running.
-                self.progress = None;
-            }
+            Update::Disconnected => self.connection = Connection::Lost,
             Update::Message(message) => self.apply_message(*message),
         }
     }
@@ -161,12 +159,13 @@ impl NowPlaying {
                 self.progress = Some(Progress {
                     elapsed: Duration::from_millis(elapsed_ms),
                     duration: Duration::from_millis(duration_ms),
-                    at: Instant::now(),
                 });
             }
-            // A seek invalidates the position until the sender sends a new
-            // one, which it does immediately after.
-            Message::Flushed => self.progress = None,
+            // A seek stops the position where it was until playback reports
+            // again — a moment later, from the audio itself. Clearing it here
+            // would blink the clock out on every seek, and on the way into
+            // every pause.
+            Message::Flushed => {}
             Message::SessionEnded => {
                 self.session = None;
                 self.title = None;
@@ -196,7 +195,6 @@ impl NowPlaying {
         self.progress = snapshot.progress.map(|p| Progress {
             elapsed: Duration::from_millis(p.elapsed_ms),
             duration: Duration::from_millis(p.duration_ms),
-            at: Instant::now(),
         });
         self.artwork = snapshot
             .artwork
@@ -207,15 +205,13 @@ impl NowPlaying {
         self.session.is_some()
     }
 
-    /// Position within the track *now*: the sender's last report advanced by
-    /// the time since we got it, never past the end of the track.
+    /// The position to show: exactly what the receiver last reported.
     fn position(&self) -> Option<(Duration, Duration)> {
-        let progress = self.progress.as_ref()?;
+        let progress = self.progress?;
         if progress.duration.is_zero() {
             return None; // a stream with no known end: no clock to show
         }
-        let elapsed = (progress.elapsed + progress.at.elapsed()).min(progress.duration);
-        Some((elapsed, progress.duration))
+        Some((progress.elapsed.min(progress.duration), progress.duration))
     }
 
     /// The centered block of text: title/artist/album (or the idle message),
@@ -760,6 +756,50 @@ mod tests {
         let screen = draw(&state, 60, 20);
         assert!(screen.contains("1:23 / 4:07"), "{screen}");
         assert!(screen.contains('━') && screen.contains('─'), "{screen}");
+    }
+
+    #[test]
+    fn the_clock_only_moves_when_the_receiver_says_so() {
+        // The pause case, and the reason nothing here extrapolates: with no
+        // new report the position stands still, however long we wait.
+        let mut state = playing();
+        state.apply(msg(Message::Progress {
+            elapsed_ms: 83_000,
+            duration_ms: 247_000,
+        }));
+        let before = draw(&state, 60, 20);
+        assert!(before.contains("1:23 / 4:07"), "{before}");
+
+        std::thread::sleep(Duration::from_millis(1_100));
+        let after = draw(&state, 60, 20);
+        assert!(
+            after.contains("1:23 / 4:07"),
+            "a paused position must not advance on its own: {after}"
+        );
+
+        // Playback resuming moves it, because the receiver says it moved.
+        state.apply(msg(Message::Progress {
+            elapsed_ms: 84_000,
+            duration_ms: 247_000,
+        }));
+        assert!(draw(&state, 60, 20).contains("1:24 / 4:07"));
+    }
+
+    #[test]
+    fn a_flush_keeps_the_position_on_screen() {
+        // A pause usually arrives as FLUSH first; clearing the position here
+        // would blank the clock on the way into every pause and blink it on
+        // every seek.
+        let mut state = playing();
+        state.apply(msg(Message::Progress {
+            elapsed_ms: 83_000,
+            duration_ms: 247_000,
+        }));
+        state.apply(msg(Message::Flushed));
+        assert!(
+            draw(&state, 60, 20).contains("1:23 / 4:07"),
+            "the last known position should stay put"
+        );
     }
 
     #[test]

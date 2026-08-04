@@ -221,8 +221,9 @@ bytes as sent), `Progress` (position and length as `Duration`s), `Flushed`,
 `SessionEnded`. `Metadata`, `Artwork` and `Progress` arrive only between
 `SessionStarted` and `SessionEnded`; each `Metadata` is a complete statement
 about the current track, not a delta, and empty `Artwork` data means the
-sender cleared it. Senders push `Progress` every few seconds rather than per
-frame, so a running clock extrapolates between events. A
+sender cleared it. `Progress` follows the audio being played rather than wall
+time — display it as-is, and note that a paused sender simply stops producing
+it. A
 host that owns its mDNS registration builds with `.advertise(false)` and
 publishes `receiver.txt_records()` itself under
 `receiver.config().service_name()`.

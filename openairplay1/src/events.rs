@@ -60,11 +60,17 @@ pub enum Event {
         /// The image bytes, exactly as sent; empty means cleared.
         data: Vec<u8>,
     },
-    /// `SET_PARAMETER` playback position for the current track. Senders push
-    /// this every few seconds and on every seek, not per frame, so a host
-    /// showing a running clock extrapolates between events and re-syncs on
-    /// each one. Delivered only between [`Event::SessionStarted`] and
-    /// [`Event::SessionEnded`].
+    /// Where playback is in the current track, reported about once a second
+    /// as the audio plays.
+    ///
+    /// This follows the audio, not the clock on the wall: the sender only
+    /// says where a track starts and ends (one capture showed a 251-second
+    /// track play to its end without a single further report), so the
+    /// position comes from the RTP timestamp of the audio actually being
+    /// played. A host can therefore display it as-is and should **not**
+    /// extrapolate between events — when a sender pauses, the reports simply
+    /// stop and the last one remains true. Delivered only between
+    /// [`Event::SessionStarted`] and [`Event::SessionEnded`].
     Progress {
         /// How far into the track playback is.
         elapsed: Duration,
