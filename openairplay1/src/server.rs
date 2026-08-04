@@ -1,6 +1,6 @@
 //! RTSP accept loop and request dispatch.
 //!
-//! Each TCP connection owns one [`Session`] that advances through
+//! Each TCP connection owns one session state machine that advances through
 //! ANNOUNCE → SETUP → RECORD and runs the UDP audio receiver. OPTIONS and the
 //! Apple-Challenge signature are handled here; the audio methods delegate to
 //! the session.
