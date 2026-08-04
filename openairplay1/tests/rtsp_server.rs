@@ -10,20 +10,35 @@ use rsa::{Pkcs1v15Sign, RsaPrivateKey};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use openairplay::{crypto, server, Config};
+use openairplay1::server::{self, Context};
+use openairplay1::AudioSink;
+use openairplay1::{crypto, Config};
 
 const MAC: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+
+/// Tests never touch audio hardware: the sink discards everything.
+struct Discard;
+
+impl AudioSink for Discard {
+    fn write(&mut self, _pcm: &[i16]) {}
+    fn flush(&mut self) {}
+}
 
 async fn start_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = Arc::new(Config {
+    let config = Config {
         name: "Test".to_string(),
         port: addr.port(),
         mac: MAC,
-        alsa_device: None, // decode-only; tests never touch hardware
+    };
+    let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let context = Arc::new(Context {
+        config,
+        sink_factory: Arc::new(|_rate, _channels| Box::new(Discard)),
+        events,
     });
-    tokio::spawn(server::serve(listener, config));
+    tokio::spawn(server::serve(listener, context));
     addr
 }
 

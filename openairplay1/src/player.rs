@@ -1,11 +1,16 @@
-//! ALSA audio output.
+//! The playback thread: ALAC decode, prebuffer, and the latency-correct
+//! start, feeding the host's [`AudioSink`].
 //!
-//! A dedicated OS thread owns the ALAC decoder and the blocking ALSA PCM
-//! handle; the async audio receiver hands it decrypted ALAC frames (tagged
-//! with their RTP timestamp) over a channel. Once the clock model is ready
-//! the first frame is held until its `play_time`, giving a latency-correct
-//! start; otherwise a fixed prebuffer is used. Blocking `writei` calls pace
-//! playback, and the ALSA queue depth is nudged to counter clock drift.
+//! A dedicated OS thread owns the ALAC decoder; the async audio receiver
+//! hands it decrypted ALAC frames (tagged with their RTP timestamp) over a
+//! channel. Once the clock model is ready the first chunk is held until its
+//! `play_time`, giving a latency-correct start; otherwise a fixed prebuffer
+//! is used. Blocking [`AudioSink::write`] calls pace playback afterwards.
+//!
+//! This is the library half of the sink seam: everything here is protocol
+//! semantics (the start instant comes from the NTP clock model). The device
+//! itself — output, pacing against the hardware, drift, gain — lives in the
+//! host's sink.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -13,14 +18,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use alsa::pcm::{Access, Format, HwParams, State, PCM};
-use alsa::{Direction, ValueOr};
 use log::{debug, info, warn};
 
 use crate::clock::{self, ClockModel};
 use crate::decode::AlacDecoder;
 use crate::sdp::AlacConfig;
-use crate::volume;
+use crate::sink::AudioSink;
 
 enum Command {
     Frame {
@@ -31,8 +34,6 @@ enum Command {
     Silence {
         ts: u32,
     },
-    /// New linear gain in `[0.0, 1.0]`.
-    Volume(f32),
     Flush,
     Stop,
 }
@@ -61,8 +62,8 @@ impl PlayerSender {
     }
 }
 
-/// Owns the playback thread. Dropping it stops the thread and closes the
-/// audio device. Held by the session for lifecycle and FLUSH.
+/// Owns the playback thread. Dropping it stops the thread and drops the sink.
+/// Held by the session for lifecycle and FLUSH.
 pub struct Player {
     tx: Option<Sender<Command>>,
     handle: Option<JoinHandle<()>>,
@@ -70,14 +71,12 @@ pub struct Player {
 }
 
 impl Player {
-    /// Spawn the playback thread. `device` is an ALSA device name
-    /// (e.g. `default`); `None` runs decode-only with no audio device (for
-    /// `--no-audio` and for hosts without working audio). Never fails: if the
-    /// device can't be opened the thread logs and discards audio so the RTSP
-    /// session keeps running.
+    /// Spawn the playback thread feeding `sink`. Never fails: a sink is
+    /// always usable (the host decides what `write` does, including
+    /// discarding audio when it has no device).
     pub fn spawn(
         config: &AlacConfig,
-        device: Option<String>,
+        sink: Box<dyn AudioSink>,
         clock: Arc<Mutex<ClockModel>>,
     ) -> Player {
         let config = *config;
@@ -86,8 +85,8 @@ impl Player {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let handle = std::thread::Builder::new()
-            .name("alsa-player".into())
-            .spawn(move || run(config, device, prebuffer_packets, rx, thread_stop, clock))
+            .name("audio-player".into())
+            .spawn(move || run(config, prebuffer_packets, rx, thread_stop, clock, sink))
             .expect("spawn player thread");
         Player {
             tx: Some(tx),
@@ -103,13 +102,6 @@ impl Player {
                 .tx
                 .clone()
                 .expect("player sender available before drop"),
-        }
-    }
-
-    /// Set playback volume from an AirPlay dB attenuation.
-    pub fn set_volume_db(&self, db: f32) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(Command::Volume(volume::db_to_gain(db)));
         }
     }
 }
@@ -140,11 +132,11 @@ fn prebuffer_packets(config: &AlacConfig) -> usize {
 
 fn run(
     config: AlacConfig,
-    device: Option<String>,
     prebuffer_packets: usize,
     rx: Receiver<Command>,
     stop: Arc<AtomicBool>,
     clock: Arc<Mutex<ClockModel>>,
+    mut sink: Box<dyn AudioSink>,
 ) {
     let mut decoder = match AlacDecoder::new(&config) {
         Ok(d) => d,
@@ -155,41 +147,13 @@ fn run(
         }
     };
 
-    let mut output = match device {
-        Some(name) => match AlsaOutput::open(&name, config.sample_rate, decoder.channels()) {
-            Ok(out) => {
-                info!(
-                    "player: ALSA \"{name}\" {} Hz {}ch, prebuffer {prebuffer_packets} packets",
-                    config.sample_rate,
-                    decoder.channels()
-                );
-                Some(out)
-            }
-            Err(e) => {
-                warn!("player: cannot open ALSA \"{name}\" ({e}); decode-only");
-                None
-            }
-        },
-        None => {
-            info!("player: --no-audio, decode-only");
-            None
-        }
-    };
-
     let channels = decoder.channels();
-    let silence_frame = vec![0i16; config.frames_per_packet as usize * channels];
-    // Drift target: keep the ALSA queue near the prebuffered depth; only
-    // correct once it strays by more than ~10 ms.
-    let target_depth = (prebuffer_packets as i64) * config.frames_per_packet as i64;
-    let drift_threshold = config.sample_rate as i64 / 100;
-    let mut playout = Playout::new(
-        prebuffer_packets,
-        clock,
-        channels,
-        target_depth,
-        drift_threshold,
+    info!(
+        "player: {} Hz {}ch, prebuffer {prebuffer_packets} packets",
+        config.sample_rate, channels
     );
-    let mut gain: f32 = 1.0;
+    let silence_frame = vec![0i16; config.frames_per_packet as usize * channels];
+    let mut playout = Playout::new(prebuffer_packets, clock);
     let mut decoded_packets: u64 = 0;
     while let Ok(command) = rx.recv() {
         // Preempt a queued backlog on teardown rather than draining it in
@@ -210,22 +174,14 @@ fn run(
                 if decoded_packets <= 3 || decoded_packets.is_multiple_of(500) {
                     debug!("player: {decoded_packets} packets decoded");
                 }
-                let mut pcm = pcm.to_vec();
-                volume::apply_gain(&mut pcm, gain);
-                playout.feed(ts, pcm, output.as_mut());
+                playout.feed(ts, pcm, sink.as_mut());
             }
             Command::Silence { ts } => {
-                playout.feed(ts, silence_frame.clone(), output.as_mut());
-            }
-            Command::Volume(g) => {
-                debug!("player: gain {g:.4}");
-                gain = g;
+                playout.feed(ts, &silence_frame, sink.as_mut());
             }
             Command::Flush => {
                 playout.reset();
-                if let Some(out) = output.as_mut() {
-                    out.reset();
-                }
+                sink.flush();
             }
             Command::Stop => break,
         }
@@ -239,43 +195,29 @@ fn drain(rx: Receiver<Command>) {
 
 /// Drives the transition from prebuffering to steady playback: a
 /// latency-correct start off the clock model (falling back to a fixed
-/// prebuffer) and ALSA-queue-depth drift correction thereafter.
+/// prebuffer).
 struct Playout {
     prebuffer: Prebuffer,
     clock: Arc<Mutex<ClockModel>>,
-    channels: usize,
-    target_depth: i64,
-    drift_threshold: i64,
     started: bool,
     first_ts: Option<u32>,
-    since_drift_check: u32,
 }
 
 impl Playout {
-    fn new(
-        prebuffer_packets: usize,
-        clock: Arc<Mutex<ClockModel>>,
-        channels: usize,
-        target_depth: i64,
-        drift_threshold: i64,
-    ) -> Playout {
+    fn new(prebuffer_packets: usize, clock: Arc<Mutex<ClockModel>>) -> Playout {
         Playout {
             prebuffer: Prebuffer::new(prebuffer_packets),
             clock,
-            channels,
-            target_depth,
-            drift_threshold,
             started: false,
             first_ts: None,
-            since_drift_check: 0,
         }
     }
 
-    fn feed(&mut self, ts: u32, pcm: Vec<i16>, output: Option<&mut AlsaOutput>) {
+    fn feed(&mut self, ts: u32, pcm: &[i16], sink: &mut dyn AudioSink) {
         if !self.started {
             self.first_ts.get_or_insert(ts);
         }
-        let Some(chunk) = self.prebuffer.push(&pcm) else {
+        let Some(chunk) = self.prebuffer.push(pcm) else {
             return;
         };
         let starting = !self.started;
@@ -283,14 +225,7 @@ impl Playout {
             self.started = true;
             self.await_start_instant();
         }
-        if let Some(out) = output {
-            let chunk = if starting {
-                chunk
-            } else {
-                self.drift_correct(chunk, out)
-            };
-            out.write(&chunk);
-        }
+        sink.write(&chunk);
     }
 
     /// Hold the first chunk until its frame's `play_time`, so audio starts at
@@ -317,50 +252,10 @@ impl Playout {
         }
     }
 
-    /// Nudge the chunk by ±1 frame to steer the ALSA queue depth back toward
-    /// the target, countering source/DAC clock drift. Checked periodically.
-    fn drift_correct(&mut self, mut chunk: Vec<i16>, out: &AlsaOutput) -> Vec<i16> {
-        self.since_drift_check += 1;
-        if self.since_drift_check < 50 {
-            return chunk;
-        }
-        self.since_drift_check = 0;
-        let Some(depth) = out.delay() else {
-            return chunk;
-        };
-        match drift_action(depth, self.target_depth, self.drift_threshold) {
-            1 if chunk.len() >= self.channels => {
-                // Queue too shallow: duplicate the last frame to add depth.
-                let tail = chunk[chunk.len() - self.channels..].to_vec();
-                chunk.extend_from_slice(&tail);
-            }
-            -1 if chunk.len() >= self.channels => {
-                // Queue too deep: drop one frame.
-                chunk.truncate(chunk.len() - self.channels);
-            }
-            _ => {}
-        }
-        chunk
-    }
-
     fn reset(&mut self) {
         self.prebuffer.reset();
         self.started = false;
         self.first_ts = None;
-        self.since_drift_check = 0;
-    }
-}
-
-/// Drift correction decision from the current ALSA queue depth: `+1` insert a
-/// frame (too shallow, risking underrun), `-1` drop a frame (too deep), `0`
-/// hold.
-fn drift_action(depth: i64, target: i64, threshold: i64) -> i32 {
-    if depth < target - threshold {
-        1
-    } else if depth > target + threshold {
-        -1
-    } else {
-        0
     }
 }
 
@@ -406,71 +301,53 @@ impl Prebuffer {
     }
 }
 
-struct AlsaOutput {
-    pcm: PCM,
-    channels: usize,
-}
-
-impl AlsaOutput {
-    fn open(device: &str, rate: u32, channels: usize) -> Result<AlsaOutput, alsa::Error> {
-        let pcm = PCM::new(device, Direction::Playback, false)?;
-        {
-            let hwp = HwParams::any(&pcm)?;
-            hwp.set_channels(channels as u32)?;
-            hwp.set_rate(rate, ValueOr::Nearest)?;
-            hwp.set_format(Format::s16())?;
-            hwp.set_access(Access::RWInterleaved)?;
-            // ~500 ms device buffer to absorb scheduling jitter; best-effort.
-            let _ = hwp.set_buffer_time_near(500_000, ValueOr::Nearest);
-            pcm.hw_params(&hwp)?;
-        }
-        pcm.prepare()?;
-        Ok(AlsaOutput { pcm, channels })
-    }
-
-    /// Write all interleaved samples, blocking to pace playback and
-    /// recovering from underruns.
-    fn write(&mut self, samples: &[i16]) {
-        let io = match self.pcm.io_i16() {
-            Ok(io) => io,
-            Err(e) => {
-                warn!("player: ALSA io handle lost: {e}");
-                return;
-            }
-        };
-        let mut frames = samples;
-        while !frames.is_empty() {
-            match io.writei(frames) {
-                Ok(0) => break,
-                Ok(written) => frames = &frames[written * self.channels..],
-                Err(e) => {
-                    if self.pcm.try_recover(e, true).is_err() {
-                        warn!("player: unrecoverable ALSA write error, dropping chunk");
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Frames currently queued in the device (how far ahead of the DAC we
-    /// are), for drift correction. `None` if ALSA can't report it.
-    fn delay(&self) -> Option<i64> {
-        self.pcm.delay().ok()
-    }
-
-    /// Reset the device after a flush so the next write starts cleanly.
-    fn reset(&mut self) {
-        if self.pcm.state() == State::Running {
-            let _ = self.pcm.drop();
-        }
-        let _ = self.pcm.prepare();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Records every delivered chunk and every flush.
+    #[derive(Clone, Default)]
+    struct Recorder {
+        writes: Arc<Mutex<Vec<Vec<i16>>>>,
+        flushes: Arc<AtomicUsize>,
+    }
+
+    impl AudioSink for Recorder {
+        fn write(&mut self, pcm: &[i16]) {
+            self.writes.lock().unwrap().push(pcm.to_vec());
+        }
+        fn flush(&mut self) {
+            self.flushes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn golden_config() -> AlacConfig {
+        let fmtp = include_str!("../tests/data/golden_fmtp.txt").trim();
+        AlacConfig::parse(&format!("96 {fmtp}")).unwrap()
+    }
+
+    fn golden_packet() -> Vec<u8> {
+        include_bytes!("../tests/data/golden_packet.bin").to_vec()
+    }
+
+    fn golden_pcm() -> Vec<i16> {
+        include_bytes!("../tests/data/golden_pcm_i16le.bin")
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect()
+    }
+
+    /// Wait (bounded) until `predicate` holds.
+    fn settle(mut predicate: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if predicate() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("player did not settle");
+    }
 
     #[test]
     fn prebuffer_holds_until_threshold_then_releases() {
@@ -507,29 +384,91 @@ mod tests {
     }
 
     #[test]
-    fn drift_action_steers_toward_target() {
-        let target = 8820;
-        let thr = 441; // 10 ms at 44100
-        assert_eq!(drift_action(target, target, thr), 0, "on target: hold");
+    fn delivers_decoded_golden_pcm_to_the_sink() {
+        let config = golden_config();
+        let prebuffer = prebuffer_packets(&config);
+        let packet = golden_packet();
+        let expected = golden_pcm();
+        let recorder = Recorder::default();
+        let writes = recorder.writes.clone();
+        let clock = Arc::new(Mutex::new(ClockModel::new(config.sample_rate)));
+        let player = Player::spawn(&config, Box::new(recorder), clock);
+        let sender = player.sender();
+
+        for i in 0..prebuffer {
+            sender.frame(i as u32 * config.frames_per_packet, packet.clone());
+        }
+        settle(|| !writes.lock().unwrap().is_empty());
+        drop(player);
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1, "the prebuffer releases as one chunk");
+        assert_eq!(writes[0].len(), prebuffer * expected.len());
+        assert_eq!(writes[0][..expected.len()], expected[..]);
+    }
+
+    #[test]
+    fn flush_drops_prebuffered_audio_and_flushes_the_sink() {
+        let config = golden_config();
+        let prebuffer = prebuffer_packets(&config);
+        let packet = golden_packet();
+        let recorder = Recorder::default();
+        let writes = recorder.writes.clone();
+        let flushes = recorder.flushes.clone();
+        let clock = Arc::new(Mutex::new(ClockModel::new(config.sample_rate)));
+        let player = Player::spawn(&config, Box::new(recorder), clock);
+        let sender = player.sender();
+
+        // Below the prebuffer threshold: nothing can have played yet.
+        for i in 0..prebuffer - 1 {
+            sender.frame(i as u32 * config.frames_per_packet, packet.clone());
+        }
+        sender.flush();
+        settle(|| flushes.load(Ordering::Relaxed) == 1);
+
+        // After the flush the prebuffer is re-armed: a full threshold of new
+        // audio plays, and none of the pre-flush audio.
+        for i in 0..prebuffer {
+            sender.frame((1000 + i as u32) * config.frames_per_packet, packet.clone());
+        }
+        settle(|| !writes.lock().unwrap().is_empty());
+        drop(player);
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
         assert_eq!(
-            drift_action(target + 100, target, thr),
-            0,
-            "within band: hold"
+            writes[0].len(),
+            prebuffer * golden_pcm().len(),
+            "only post-flush audio reaches the sink"
         );
-        assert_eq!(
-            drift_action(target - 100, target, thr),
-            0,
-            "within band: hold"
-        );
-        assert_eq!(
-            drift_action(target - 500, target, thr),
-            1,
-            "too shallow: insert"
-        );
-        assert_eq!(
-            drift_action(target + 500, target, thr),
-            -1,
-            "too deep: drop"
+    }
+
+    #[test]
+    fn lost_packets_are_concealed_with_silence() {
+        let config = golden_config();
+        let prebuffer = prebuffer_packets(&config);
+        let packet = golden_packet();
+        let pcm_len = golden_pcm().len(); // frames_per_packet * channels
+        let recorder = Recorder::default();
+        let writes = recorder.writes.clone();
+        let clock = Arc::new(Mutex::new(ClockModel::new(config.sample_rate)));
+        let player = Player::spawn(&config, Box::new(recorder), clock);
+        let sender = player.sender();
+
+        for i in 0..prebuffer - 1 {
+            sender.frame(i as u32 * config.frames_per_packet, packet.clone());
+        }
+        sender.silence((prebuffer - 1) as u32 * config.frames_per_packet);
+        settle(|| !writes.lock().unwrap().is_empty());
+        drop(player);
+
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        let chunk = &writes[0];
+        assert_eq!(chunk.len(), prebuffer * pcm_len);
+        assert!(
+            chunk[chunk.len() - pcm_len..].iter().all(|&s| s == 0),
+            "the lost packet arrives as a silent frame"
         );
     }
 }

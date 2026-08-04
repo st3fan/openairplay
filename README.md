@@ -1,28 +1,34 @@
 # OpenAirPlay
 
-A minimal **AirPlay 1 (RAOP / AirTunes) audio receiver** for Linux, written in
-Rust. It lets stock Apple clients — iPhone, iPad, Mac, iTunes — discover it and
-stream audio to it, which it plays on an ALSA device. Point Control Center (or
-the AirPlay menu) at it and press play.
+A minimal **AirPlay 1 (RAOP / AirTunes) audio receiver**, written in Rust.
+Stock Apple clients — iPhone, iPad, Mac, iTunes — discover it and stream
+audio to it. This repo produces two artifacts:
 
-It implements the full RAOP audio path: mDNS discovery, the RTSP handshake with
-the `Apple-Challenge` response, AES/RSA decryption, ALAC decode, a jitter buffer
-with packet retransmission, software volume, and NTP clock synchronisation for a
-latency-correct start.
+- **`openairplay1`** — an embeddable receiver **library**: network in,
+  decoded PCM + session events out. No ALSA; builds and tests on Linux and
+  macOS. See [Embedding](#embedding).
+- **`openairplay1-receiver`** — the standalone **Linux/ALSA binary** built
+  on it: point Control Center (or the AirPlay menu) at it and press play.
+
+It implements the full RAOP audio path: mDNS discovery, the RTSP handshake
+with the `Apple-Challenge` response, AES/RSA decryption, ALAC decode, a
+jitter buffer with packet retransmission, software volume, and NTP clock
+synchronisation for a latency-correct start.
 
 ## Features
 
-- **Discoverable** as an AirPlay speaker — advertises `_raop._tcp` by talking to
-  the system `avahi-daemon` directly over D-Bus (no `avahi-utils` needed).
+- **Discoverable** as an AirPlay speaker — advertises `_raop._tcp` by talking
+  to the system `avahi-daemon` directly over D-Bus (no `avahi-utils` needed).
 - **Authenticated handshake** — answers the `Apple-Challenge` with the
   well-known AirPort Express key, so real Apple senders accept it.
-- **Encrypted or unencrypted** ALAC streams (RSA-OAEP session key, AES-128-CBC
-  audio), decoded to 44.1 kHz / 16-bit / stereo PCM.
-- **Robust playback** — a sequence-ordered jitter buffer reorders UDP packets,
-  requests retransmits for gaps, and conceals unrecoverable losses with silence.
+- **Encrypted or unencrypted** ALAC streams (RSA-OAEP session key,
+  AES-128-CBC audio), decoded to 44.1 kHz / 16-bit / stereo PCM.
+- **Robust playback** — a sequence-ordered jitter buffer reorders UDP
+  packets, requests retransmits for gaps, and conceals unrecoverable losses
+  with silence.
 - **Clock sync** — uses the NTP timing channel and sync packets to start
-  playback at the right moment and to counter drift between the sender's clock
-  and the sound card.
+  playback at the right moment and to counter drift between the sender's
+  clock and the sound card.
 - **Software volume** from `SET_PARAMETER`, and single-client exclusion (a
   second sender is refused `453`).
 
@@ -31,54 +37,58 @@ mirroring, and password protection.
 
 ## Requirements
 
+The **receiver binary** targets Linux:
+
 - Linux with **ALSA** and its development headers (Debian/Ubuntu:
   `libasound2-dev`) — needed to build.
 - A working audio output device (or run with `--no-audio` to decode only).
-- A running **`avahi-daemon`** with access to the system D-Bus — needed only for
-  discovery. Without it the receiver still serves RTSP; you can connect by
-  address for testing.
-- A recent stable **Rust** toolchain.
+- A running **`avahi-daemon`** with access to the system D-Bus — needed only
+  for discovery. Without it the receiver still serves RTSP; you can connect
+  by address for testing.
 
-## Build
+The **library** has no audio-output dependency and also builds and tests on
+macOS (`cargo test -p openairplay1`). Both need a recent stable **Rust**
+toolchain.
+
+## Build & run
 
 ```sh
-cargo build --release        # binary at target/release/openairplay
+cargo build --release        # binary at target/release/openairplay1-receiver
 ```
-
-## Run
 
 The simplest case — advertise under a friendly name and play to the default
 ALSA device:
 
 ```sh
-./target/release/openairplay --name "Living Room"
+./target/release/openairplay1-receiver --name "Living Room"
 ```
 
 You should see it announce itself:
 
 ```
-INFO openairplay: starting receiver "Living Room" (mac AABBCCDDEEFF, rtsp port 5000, audio default)
-INFO openairplay::avahi: advertising "AABBCCDDEEFF@Living Room" on _raop._tcp port 5000 via avahi 0.8
+INFO openairplay1_receiver: starting AirPlay 1 receiver "Living Room" (mac AABBCCDDEEFF, rtsp port 5000)
+INFO openairplay1::avahi: advertising "AABBCCDDEEFF@Living Room" on _raop._tcp port 5000 via avahi 0.8
 ```
 
-Now open Control Center on an iPhone/iPad/Mac (or the speaker menu in iTunes),
-pick **Living Room**, and start playing — audio comes out of your ALSA device.
-Press `Ctrl-C` to stop; the receiver withdraws its advertisement on exit.
+Now open Control Center on an iPhone/iPad/Mac (or the speaker menu in
+iTunes), pick **Living Room**, and start playing — audio comes out of your
+ALSA device. Press `Ctrl-C` to stop; the receiver withdraws its
+advertisement on exit.
 
 ### More examples
 
 ```sh
 # Play to a specific ALSA device (see `aplay -L` for names)
-./target/release/openairplay --name "Kitchen" --alsa-device plughw:0,0
+./target/release/openairplay1-receiver --name "Kitchen" --alsa-device plughw:0,0
 
 # Decode only, don't open any audio device (useful on a headless box)
-./target/release/openairplay --no-audio
+./target/release/openairplay1-receiver --no-audio
 
 # Run without advertising (connect by IP address for testing)
-./target/release/openairplay --no-avahi
+./target/release/openairplay1-receiver --no-avahi
 
 # Verbose logging (RTSP requests, per-packet and player/timing detail)
-RUST_LOG=debug ./target/release/openairplay
+RUST_LOG=debug ./target/release/openairplay1-receiver
 ```
 
 ### Options
@@ -92,18 +102,57 @@ RUST_LOG=debug ./target/release/openairplay
 | `--no-audio` | — | Decode only; don't open an audio device |
 | `--no-avahi` | — | Don't advertise the service |
 
-Logging is controlled by `RUST_LOG` (`error`/`warn`/`info`/`debug`); it defaults
-to `info`.
+Logging is controlled by `RUST_LOG` (`error`/`warn`/`info`/`debug`); it
+defaults to `info`.
+
+## Embedding
+
+The library's public API is small: build a `Receiver`, hand it a sink
+factory and an event channel, run it on your tokio runtime.
+
+```rust,no_run
+use openairplay1::{AudioSink, Event, Receiver};
+
+struct MySink; // your PCM → speaker path
+
+impl AudioSink for MySink {
+    fn write(&mut self, pcm: &[i16]) { /* blocking write paces playback */ }
+    fn flush(&mut self) { /* seek: drop your device state */ }
+}
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let receiver = Receiver::builder().name("Office").build()?;
+    let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if let Event::Volume { db } = event { /* your gain path */ }
+        }
+    });
+    receiver.run(|_rate, _channels| Box::new(MySink), events).await
+}
+```
+
+The library keeps the session semantics (RTSP handshake, decrypt, jitter
+buffer and retransmits, the NTP clock model, ALAC decode, the prebuffer and
+latency-correct start, FLUSH handling); the host sees only PCM and events —
+`SessionStarted`, `Volume` (in AirPlay dB), `Flushed`, `SessionEnded`. A
+host that owns its mDNS registration builds with `.advertise(false)` and
+publishes `receiver.txt_records()` itself under
+`receiver.config().service_name()`.
 
 ## How it works
 
 Each RTSP connection drives a session state machine
 (`ANNOUNCE → SETUP → RECORD`), which binds the three UDP channels (audio,
-control, timing) and spawns the tasks that decrypt, reorder, decode, and play
-the stream. The source is organised as a library plus a thin binary:
+control, timing) and spawns the tasks that decrypt, reorder, decode, and
+play the stream. The workspace has two crates:
+
+**`openairplay1/`** — the library (network → PCM):
 
 | Module | Responsibility |
 |--------|----------------|
+| `receiver` | The public facade: `Receiver::builder()` → `run(sink_factory, events)` |
 | `crypto` | AirPort RSA key, `Apple-Response`, AES session-key decrypt |
 | `rtsp` / `sdp` | RTSP message parsing, SDP / `fmtp` parsing |
 | `session` | Per-connection state machine, UDP tasks, retransmit + timing exchange |
@@ -111,8 +160,13 @@ the stream. The source is organised as a library plus a thin binary:
 | `jitter` | Sequence-ordered jitter buffer with loss reporting |
 | `clock` | NTP offset model, sync anchor, `play_time` |
 | `decode` | ALAC decoding (via the `alac` crate) |
-| `player` | ALSA output thread: prebuffer, timed start, volume, drift |
+| `player` | Playback thread: prebuffer, timed start, feeding the host's sink |
+| `sink` / `events` | The host boundary: `AudioSink` trait, session `Event`s |
 | `avahi` | `_raop._tcp` registration over the Avahi D-Bus API |
+
+**`openairplay1-receiver/`** — the binary (PCM → speaker): the CLI plus the
+ALSA sink (blocking `writei`, frame-stuffing drift correction, dB→linear
+gain); it consumes only the library's public API.
 
 See [`notes/design.md`](notes/design.md) for the protocol design, and
 `notes/milestone-*.md` for how each part was built and verified.
@@ -123,19 +177,20 @@ See [`notes/design.md`](notes/design.md) for the protocol design, and
 cargo test        # no audio hardware or Avahi daemon needed
 ```
 
-The suite is hardware-independent: it never opens ALSA and stubs the network,
-covering the crypto, RTSP/SDP parsing, jitter buffer, clock/NTP math, volume,
-and the packet formats, plus end-to-end integration tests that drive the RTSP
-handshake and audio path over real sockets. Audio output, discovery, and clock
-sync were additionally verified manually on real hardware with a synthetic
-sender.
+The suite is hardware-independent: it never opens ALSA and stubs the
+network, covering the crypto, RTSP/SDP parsing, jitter buffer, clock/NTP
+math, volume, and the packet formats, the playback thread against a fake
+sink, plus end-to-end integration tests that drive the RTSP handshake and
+audio path over real sockets. Audio output, discovery, and clock sync were
+additionally verified manually on real hardware with a synthetic sender.
 
 ## Notes and limitations
 
-- The embedded `src/airport.pem` is the well-known AirPort Express RSA private
-  key (as shipped by shairport-sync). It is what lets any third-party receiver
-  answer the `Apple-Challenge`; it is not a secret.
-- Drift correction is coarse frame-level "stuffing" (as shairport's is), not a
-  sample-rate-converting resampler — it prevents drift-induced under/overruns
-  rather than phase-locking to the sender's clock.
+- The embedded `openairplay1/src/airport.pem` is the well-known AirPort
+  Express RSA private key (as shipped by shairport-sync). It is what lets
+  any third-party receiver answer the `Apple-Challenge`; it is not a
+  secret.
+- Drift correction is coarse frame-level "stuffing" (as shairport's is),
+  not a sample-rate-converting resampler — it prevents drift-induced
+  under/overruns rather than phase-locking to the sender's clock.
 - Only one sender can stream at a time.

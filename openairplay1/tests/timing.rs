@@ -10,9 +10,19 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
-use openairplay::clock::ns_to_ntp;
-use openairplay::session::DecryptedAudio;
-use openairplay::{server, Config};
+use openairplay1::clock::ns_to_ntp;
+use openairplay1::server::{self, Context};
+use openairplay1::AudioSink;
+use openairplay1::Config;
+use openairplay1::DecryptedAudio;
+
+/// Tests never touch audio hardware: the sink discards everything.
+struct Discard;
+
+impl AudioSink for Discard {
+    fn write(&mut self, _pcm: &[i16]) {}
+    fn flush(&mut self) {}
+}
 
 async fn start() -> (
     SocketAddr,
@@ -20,14 +30,19 @@ async fn start() -> (
 ) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = Arc::new(Config {
+    let config = Config {
         name: "Test".to_string(),
         port: addr.port(),
         mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
-        alsa_device: None,
-    });
+    };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(server::serve_with_observer(listener, config, Some(tx)));
+    let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let context = Arc::new(Context {
+        config,
+        sink_factory: Arc::new(|_rate, _channels| Box::new(Discard)),
+        events,
+    });
+    tokio::spawn(server::serve_with_observer(listener, context, Some(tx)));
     (addr, rx)
 }
 

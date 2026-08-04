@@ -1,0 +1,17 @@
+[package]
+name = "openairplay1-receiver"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Standalone AirPlay 1 (RAOP) receiver for Linux/ALSA"
+license = "MIT"
+repository = "https://github.com/st3fan/openairplay1"
+keywords = ["airplay", "airplay1", "raop", "audio", "receiver", "alsa"]
+categories = ["multimedia::audio", "command-line-utilities"]
+
+[dependencies]
+openairplay1 = { path = "../openairplay1" }
+alsa = "0.12"
+env_logger = "0.11"
+log = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }

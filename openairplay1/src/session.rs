@@ -17,11 +17,13 @@ use tokio::task::JoinHandle;
 
 use crate::clock::{self, ClockModel};
 use crate::crypto;
+use crate::events::{Event, EventSender};
 use crate::jitter::{Delivery, JitterBuffer};
 use crate::player::{Player, PlayerSender};
 use crate::rtp::{self, AudioPacket};
 use crate::rtsp::{Request, Response};
 use crate::sdp::{AlacConfig, Sdp};
+use crate::sink::SinkFactory;
 
 /// How often the audio task services retransmit requests and forced skips.
 const SERVICE_INTERVAL: Duration = Duration::from_millis(20);
@@ -56,17 +58,22 @@ impl Drop for SlotGuard {
     }
 }
 
-/// A decrypted audio packet, surfaced to an optional observer. Milestone 2
-/// uses this to prove the crypto path in tests and logs; milestone 3 will
-/// feed it to the ALAC decoder.
+/// A decrypted audio packet, surfaced to an optional observer (the
+/// integration tests use it to prove the crypto path; production passes no
+/// observer).
 #[derive(Debug, Clone)]
 pub struct DecryptedAudio {
+    /// RTP sequence number of the packet.
     pub sequence: u16,
+    /// RTP timestamp (derived from the first packet's anchor).
     pub timestamp: u32,
+    /// Whether the plaintext passes a basic ALAC stereo sanity check.
     pub looks_like_alac: bool,
+    /// The decrypted ALAC frame, exactly as carried in the RTP payload.
     pub frame: Vec<u8>,
 }
 
+/// The receiving end of the decrypted-audio observation channel.
 pub type AudioObserver = tokio::sync::mpsc::UnboundedSender<DecryptedAudio>;
 
 /// Cryptographic and format parameters captured at ANNOUNCE.
@@ -82,8 +89,13 @@ pub struct Session {
     params: Option<StreamParams>,
     tasks: Vec<JoinHandle<()>>,
     observer: Option<AudioObserver>,
-    /// ALSA device to play to, or `None` for decode-only (`--no-audio`).
-    audio_device: Option<String>,
+    /// Creates the stream's audio sink at SETUP.
+    sink_factory: SinkFactory,
+    /// Session milestones for the host.
+    events: EventSender,
+    /// True between SETUP and TEARDOWN/drop; guards the one-time
+    /// [`Event::SessionEnded`].
+    streaming: bool,
     player: Option<Player>,
     /// Signals the audio task to flush its jitter buffer to a given sequence
     /// (or re-anchor when `None`).
@@ -102,13 +114,16 @@ pub struct Session {
 impl Session {
     pub fn new(
         observer: Option<AudioObserver>,
-        audio_device: Option<String>,
+        sink_factory: SinkFactory,
+        events: EventSender,
         peer_ip: IpAddr,
         slot: SessionSlot,
     ) -> Self {
         Session {
             observer,
-            audio_device,
+            sink_factory,
+            events,
+            streaming: false,
             player: None,
             flush_tx: None,
             peer_ip,
@@ -225,11 +240,17 @@ impl Session {
         // sync packets (anchor), read by the player for latency-correct start.
         let clock = Arc::new(Mutex::new(ClockModel::new(params.alac.sample_rate)));
 
-        // Spawn the ALSA player (decode-only if no device / open fails) and
-        // hand the receiver a sender so decrypted frames reach playback.
-        let player = Player::spawn(&params.alac, self.audio_device.clone(), clock.clone());
+        // The host's sink for this stream, created with the negotiated format;
+        // the player thread decodes and feeds it.
+        self.send_event(Event::SessionStarted {
+            rate: params.alac.sample_rate,
+            channels: params.alac.channels,
+        });
+        let sink = (self.sink_factory)(params.alac.sample_rate, params.alac.channels);
+        let player = Player::spawn(&params.alac, sink, clock.clone());
         let player_sender = player.sender();
         self.player = Some(player);
+        self.streaming = true;
 
         // Share the control socket: the audio task sends resend requests on it
         // while the control task reads sync packets.
@@ -284,6 +305,7 @@ impl Session {
                 self.player = None;
                 self.flush_tx = None;
                 self.slot_guard = None; // release the streaming slot immediately
+                self.end_session();
                 info!("TEARDOWN: session closed");
                 Some(Response::ok())
             }
@@ -297,6 +319,7 @@ impl Session {
                 if let Some(tx) = &self.flush_tx {
                     let _ = tx.send(flush_to);
                 }
+                self.send_event(Event::Flushed);
                 Some(Response::ok())
             }
             "SET_PARAMETER" => {
@@ -305,9 +328,7 @@ impl Session {
                     if let Some(v) = line.trim().strip_prefix("volume:") {
                         if let Ok(db) = v.trim().parse::<f32>() {
                             debug!("SET_PARAMETER volume {db} dB");
-                            if let Some(player) = &self.player {
-                                player.set_volume_db(db);
-                            }
+                            self.send_event(Event::Volume { db });
                         }
                     }
                 }
@@ -315,6 +336,18 @@ impl Session {
             }
             "GET_PARAMETER" => Some(Response::ok()),
             _ => None,
+        }
+    }
+
+    fn send_event(&self, event: Event) {
+        let _ = self.events.send(event);
+    }
+
+    /// Report [`Event::SessionEnded`] once per started session.
+    fn end_session(&mut self) {
+        if self.streaming {
+            self.streaming = false;
+            self.send_event(Event::SessionEnded);
         }
     }
 
@@ -328,6 +361,7 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.stop_tasks();
+        self.end_session();
     }
 }
 
@@ -610,6 +644,133 @@ async fn timing_task(
 mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD;
+    use std::io::Cursor;
+    use std::net::Ipv4Addr;
+    use tokio::io::BufReader;
+
+    struct DiscardSink;
+
+    impl crate::sink::AudioSink for DiscardSink {
+        fn write(&mut self, _pcm: &[i16]) {}
+        fn flush(&mut self) {}
+    }
+
+    fn session() -> (Session, tokio::sync::mpsc::UnboundedReceiver<Event>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let factory: SinkFactory = Arc::new(|_rate, _channels| Box::new(DiscardSink));
+        let session = Session::new(
+            None,
+            factory,
+            tx,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            SessionSlot::new(),
+        );
+        (session, rx)
+    }
+
+    async fn request(raw: &str) -> Request {
+        let mut reader = BufReader::new(Cursor::new(raw.as_bytes().to_vec()));
+        crate::rtsp::read_request(&mut reader)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    const SDP_BODY: &str = "v=0\r\n\
+        o=iTunes 3413821438 0 IN IP4 192.168.1.2\r\n\
+        s=iTunes\r\n\
+        c=IN IP4 192.168.1.10\r\n\
+        t=0 0\r\n\
+        m=audio 0 RTP/AVP 96\r\n\
+        a=rtpmap:96 AppleLossless\r\n\
+        a=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\n";
+
+    #[tokio::test]
+    async fn session_lifecycle_emits_the_events() {
+        let (mut session, mut events) = session();
+
+        let announce = request(&format!(
+            "ANNOUNCE rtsp://192.168.1.10/1 RTSP/1.0\r\n\
+             CSeq: 2\r\nContent-Length: {}\r\n\r\n{SDP_BODY}",
+            SDP_BODY.len()
+        ))
+        .await;
+        assert_eq!(session.handle_announce(&announce).status(), 200);
+        assert!(events.try_recv().is_err(), "no event before SETUP");
+
+        let setup = request(
+            "SETUP rtsp://192.168.1.10/1 RTSP/1.0\r\n\
+             CSeq: 3\r\n\
+             Transport: RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002\r\n\
+             \r\n",
+        )
+        .await;
+        let response = session
+            .handle_setup(&setup, IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::SessionStarted {
+                rate: 44100,
+                channels: 2
+            })
+        );
+
+        let set_parameter = request(
+            "SET_PARAMETER rtsp://192.168.1.10/1 RTSP/1.0\r\n\
+             CSeq: 4\r\nContent-Type: text/parameters\r\nContent-Length: 18\r\n\
+             \r\nvolume: -20.000000",
+        )
+        .await;
+        assert_eq!(session.handle_other(&set_parameter).unwrap().status(), 200);
+        assert_eq!(events.try_recv(), Ok(Event::Volume { db: -20.0 }));
+
+        let flush = request("FLUSH rtsp://192.168.1.10/1 RTSP/1.0\r\nCSeq: 5\r\n\r\n").await;
+        assert_eq!(session.handle_other(&flush).unwrap().status(), 200);
+        assert_eq!(events.try_recv(), Ok(Event::Flushed));
+
+        let teardown = request("TEARDOWN rtsp://192.168.1.10/1 RTSP/1.0\r\nCSeq: 6\r\n\r\n").await;
+        assert_eq!(session.handle_other(&teardown).unwrap().status(), 200);
+        assert_eq!(events.try_recv(), Ok(Event::SessionEnded));
+
+        // The end is reported exactly once: drop after TEARDOWN adds nothing.
+        drop(session);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_streaming_session_ends_it() {
+        let (mut session, mut events) = session();
+        let announce = request(&format!(
+            "ANNOUNCE rtsp://192.168.1.10/1 RTSP/1.0\r\n\
+             CSeq: 2\r\nContent-Length: {}\r\n\r\n{SDP_BODY}",
+            SDP_BODY.len()
+        ))
+        .await;
+        session.handle_announce(&announce);
+        let setup = request(
+            "SETUP rtsp://192.168.1.10/1 RTSP/1.0\r\n\
+             CSeq: 3\r\n\
+             Transport: RTP/AVP/UDP;unicast;mode=record;control_port=6001;timing_port=6002\r\n\
+             \r\n",
+        )
+        .await;
+        session
+            .handle_setup(&setup, IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .await;
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::SessionStarted {
+                rate: 44100,
+                channels: 2
+            })
+        );
+
+        // The client disconnected without TEARDOWN.
+        drop(session);
+        assert_eq!(events.try_recv(), Ok(Event::SessionEnded));
+    }
 
     #[test]
     fn extracts_transport_ports() {

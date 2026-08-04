@@ -13,16 +13,27 @@ use log::{debug, info, warn};
 use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::events::EventSender;
 use crate::rtsp::{read_request, Request, Response};
 use crate::session::{AudioObserver, Session, SessionSlot};
+use crate::sink::SinkFactory;
 use crate::{crypto, Config};
 
 pub const SERVER_ID: &str = "AirTunes/105.1";
 pub const PUBLIC_METHODS: &str =
     "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, TEARDOWN, OPTIONS, GET_PARAMETER, SET_PARAMETER";
 
-pub async fn serve(listener: TcpListener, config: Arc<Config>) -> io::Result<()> {
-    serve_with_observer(listener, config, None).await
+/// Everything a connection handler needs, shared across the server.
+pub struct Context {
+    pub config: Config,
+    /// Creates each stream's audio sink at SETUP.
+    pub sink_factory: SinkFactory,
+    /// Session milestones for the host.
+    pub events: EventSender,
+}
+
+pub async fn serve(listener: TcpListener, context: Arc<Context>) -> io::Result<()> {
+    serve_with_observer(listener, context, None).await
 }
 
 /// Like [`serve`], but every decrypted audio packet is also forwarded to
@@ -30,19 +41,19 @@ pub async fn serve(listener: TcpListener, config: Arc<Config>) -> io::Result<()>
 /// production entry point passes `None`.
 pub async fn serve_with_observer(
     listener: TcpListener,
-    config: Arc<Config>,
+    context: Arc<Context>,
     observer: Option<AudioObserver>,
 ) -> io::Result<()> {
     // Shared across connections so only one client can stream at a time.
     let slot = SessionSlot::new();
     loop {
         let (stream, peer) = listener.accept().await?;
-        let config = config.clone();
+        let context = context.clone();
         let observer = observer.clone();
         let slot = slot.clone();
         tokio::spawn(async move {
             info!("[{peer}] connected");
-            if let Err(e) = handle_connection(stream, peer, config, observer, slot).await {
+            if let Err(e) = handle_connection(stream, peer, context, observer, slot).await {
                 warn!("[{peer}] connection error: {e}");
             }
             info!("[{peer}] disconnected");
@@ -53,18 +64,24 @@ pub async fn serve_with_observer(
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
-    config: Arc<Config>,
+    context: Arc<Context>,
     observer: Option<AudioObserver>,
     slot: SessionSlot,
 ) -> io::Result<()> {
     let local_addr = stream.local_addr()?;
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    let mut session = Session::new(observer, config.alsa_device.clone(), peer.ip(), slot);
+    let mut session = Session::new(
+        observer,
+        context.sink_factory.clone(),
+        context.events.clone(),
+        peer.ip(),
+        slot,
+    );
 
     while let Some(request) = read_request(&mut reader).await? {
         log_request(&peer, &request);
-        let response = dispatch(&mut session, &request, local_addr, &config).await;
+        let response = dispatch(&mut session, &request, local_addr, &context.config).await;
         debug!("[{peer}] -> {}", response.status());
         response.write_to(&mut write_half).await?;
     }
