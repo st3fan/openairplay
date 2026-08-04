@@ -212,4 +212,18 @@ in the library, one in the binary, additive API.
 
 ## Status
 
-Draft — awaiting review.
+Approved; phase 1 implemented (PR #23) — unit + integration tests green,
+clippy/fmt/rustdoc clean, no new dependencies, library still ALSA-free.
+
+Two things the implementation confirmed:
+
+- The `MAX_BODY` raise is load-bearing, not hygiene: reverting the constant
+  makes the new integration test fail with an EOF from the server, i.e. the
+  old 1 MB cap really did drop the RTSP connection on a large artwork body.
+- Nothing had to change in `avahi.rs` — `md=0,1,2` was already advertised, so
+  there is no AirPlay 1 counterpart to openairplay2's features-bitmask fix.
+
+Outstanding: hardware validation against a real sender (see the acceptance
+criteria), including whether AirPlay 1 senders push metadata before or after
+SETUP. openairplay2's sender pushed ~1 s *after*, leaving its latch idle; if
+that holds here too, the latch stays as armor for other senders.
