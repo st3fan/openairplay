@@ -1,5 +1,9 @@
 # OpenAirPlay
 
+[![crates.io](https://img.shields.io/crates/v/openairplay1.svg)](https://crates.io/crates/openairplay1)
+[![docs.rs](https://img.shields.io/docsrs/openairplay1)](https://docs.rs/openairplay1)
+[![CI](https://github.com/st3fan/openairplay1/actions/workflows/ci.yml/badge.svg)](https://github.com/st3fan/openairplay1/actions/workflows/ci.yml)
+
 A minimal **AirPlay 1 (RAOP / AirTunes) audio receiver**, written in Rust.
 Stock Apple clients — iPhone, iPad, Mac, iTunes — discover it and stream
 audio to it. This repo produces two artifacts:
@@ -56,6 +60,12 @@ toolchain.
 cargo build --release        # binary at target/release/openairplay1-receiver
 ```
 
+Or install the released binary straight from crates.io:
+
+```sh
+cargo install openairplay1-receiver
+```
+
 The simplest case — advertise under a friendly name and play to the default
 ALSA device:
 
@@ -109,6 +119,11 @@ defaults to `info`.
 
 The library's public API is small: build a `Receiver`, hand it a sink
 factory and an event channel, run it on your tokio runtime.
+
+```toml
+[dependencies]
+openairplay1 = "0.1"
+```
 
 ```rust,no_run
 use openairplay1::{AudioSink, Event, Receiver};
