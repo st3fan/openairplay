@@ -7,9 +7,21 @@
 //! too far ahead is skipped and reported as lost so the player can conceal it
 //! with silence and keep timing.
 
-/// Capacity in packets. Also the maximum lead (highest received seq minus
-/// next-to-deliver) before the buffer force-skips a missing packet.
+/// Capacity in packets. Packets more than this far ahead of the
+/// next-to-deliver are dropped on insert, so they can never alias a live slot.
 pub const CAPACITY: usize = 512;
+
+/// Maximum lead (highest received seq minus next-to-deliver) before the buffer
+/// gives up on a missing packet and force-skips it. At 352 frames per packet
+/// and 44.1 kHz this is ~1 s of audio, which bounds how long a gap can stall
+/// playback while retransmits are attempted (one every
+/// [`RESEND_BACKOFF`](crate::session)).
+///
+/// **This must stay strictly below [`CAPACITY`]**, and the constructor asserts
+/// it: `insert` drops anything `CAPACITY` or more ahead, so with the two equal
+/// the highest stored sequence can never reach the skip threshold and a gap
+/// the sender never fills stalls the stream forever.
+pub const MAX_LEAD: usize = 128;
 
 /// Signed distance from `b` to `a` on the 16-bit sequence circle: positive
 /// when `a` is ahead of `b`, handling wraparound at 0xFFFF→0x0000.
@@ -38,13 +50,15 @@ pub struct JitterBuffer {
 
 impl Default for JitterBuffer {
     fn default() -> Self {
-        JitterBuffer::new(CAPACITY)
+        JitterBuffer::new(MAX_LEAD)
     }
 }
 
 impl JitterBuffer {
     pub fn new(max_lead: usize) -> JitterBuffer {
-        assert!(max_lead <= CAPACITY);
+        // Strictly below CAPACITY: see MAX_LEAD — at CAPACITY the force-skip
+        // can never fire and a permanent gap stalls playback forever.
+        assert!(max_lead < CAPACITY);
         JitterBuffer {
             slots: (0..CAPACITY).map(|_| None).collect(),
             next_seq: None,
@@ -233,6 +247,24 @@ mod tests {
         jb.insert(0xFFFF, frame(1));
         jb.insert(0x0001, frame(3)); // 0x0000 missing
         assert_eq!(jb.missing(), vec![0x0000]);
+    }
+
+    #[test]
+    fn a_permanent_gap_is_skipped_so_playback_resumes() {
+        // The stall a real iPhone triggers: FLUSH re-arms the buffer at a
+        // sequence the sender has already sent and will not send again, so
+        // the packet at the front never arrives. Everything after it must
+        // still reach the player.
+        let mut jb = JitterBuffer::default();
+        jb.reset(Some(1000));
+        for i in 1..=2000u16 {
+            jb.insert(1000 + i, frame(1));
+        }
+        let delivered = jb.pop_ready();
+        assert!(
+            !delivered.is_empty(),
+            "a gap the sender never fills must not stall the stream forever"
+        );
     }
 
     #[test]

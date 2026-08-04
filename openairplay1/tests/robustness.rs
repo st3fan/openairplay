@@ -102,6 +102,97 @@ fn audio_packet(seq: u16, ts: u32, payload: &[u8]) -> Vec<u8> {
     pkt
 }
 
+/// Wrap an audio packet the way a sender answers a resend request: payload
+/// type 0x56 and a 4-byte header ahead of the original RTP packet.
+fn resend_reply(seq: u16, ts: u32, payload: &[u8]) -> Vec<u8> {
+    let mut pkt = vec![0x80, 0xD6, 0x00, 0x01];
+    pkt.extend_from_slice(&audio_packet(seq, ts, payload));
+    pkt
+}
+
+#[tokio::test]
+async fn a_resend_reply_on_the_control_channel_fills_the_gap() {
+    // Senders answer resend requests on the *control* channel, not the audio
+    // one. A reply that stops at the control task leaves the gap unfilled and
+    // playback stalls until the buffer force-skips — which is what a real
+    // iPhone triggered after its FLUSH.
+    let (addr, mut audio_rx) = start().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    announce(&mut stream).await;
+
+    let control = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let control_port = control.local_addr().unwrap().port();
+    let setup = format!(
+        "SETUP rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 2\r\n\
+         Transport: RTP/AVP/UDP;unicast;mode=record;control_port={control_port};timing_port=6002\r\n\r\n"
+    );
+    let (status, headers) = rtsp(&mut stream, &setup).await;
+    assert_eq!(status, "RTSP/1.0 200 OK");
+    let server_port = transport_port(&headers, "server_port");
+    let server_control_port = transport_port(&headers, "control_port");
+
+    let (status, _) = rtsp(
+        &mut stream,
+        "RECORD rtsp://127.0.0.1/1 RTSP/1.0\r\nCSeq: 3\r\nRTP-Info: seq=100;rtptime=0\r\n\r\n",
+    )
+    .await;
+    assert_eq!(status, "RTSP/1.0 200 OK");
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let audio_dst = SocketAddr::from(([127, 0, 0, 1], server_port));
+    let payload_a = [0x20u8, 0xAA, 0xAA];
+    let payload_b = [0x20u8, 0xBB, 0xBB];
+    let payload_c = [0x20u8, 0xCC, 0xCC];
+
+    // seq 100 and 102 over the audio channel; 101 is missing.
+    client
+        .send_to(&audio_packet(100, 0, &payload_a), audio_dst)
+        .await
+        .unwrap();
+    client
+        .send_to(&audio_packet(102, 704, &payload_c), audio_dst)
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), audio_rx.recv())
+        .await
+        .expect("delivery")
+        .unwrap();
+    assert_eq!(first.sequence, 100);
+
+    // Wait for the resend request, then answer it the way a sender does:
+    // on the control channel, wrapped as a 0x56 packet.
+    let mut buf = [0u8; 32];
+    tokio::time::timeout(Duration::from_secs(2), control.recv_from(&mut buf))
+        .await
+        .expect("resend request")
+        .unwrap();
+    control
+        .send_to(
+            &resend_reply(101, 352, &payload_b),
+            SocketAddr::from(([127, 0, 0, 1], server_control_port)),
+        )
+        .await
+        .unwrap();
+
+    // The recovered packet unblocks 101 and the buffered 102.
+    let second = tokio::time::timeout(Duration::from_secs(2), audio_rx.recv())
+        .await
+        .expect("resend reply must reach the jitter buffer")
+        .unwrap();
+    let third = tokio::time::timeout(Duration::from_secs(2), audio_rx.recv())
+        .await
+        .expect("delivery")
+        .unwrap();
+    assert_eq!(
+        (second.sequence, second.frame.as_slice()),
+        (101, payload_b.as_slice())
+    );
+    assert_eq!(
+        (third.sequence, third.frame.as_slice()),
+        (102, payload_c.as_slice())
+    );
+}
+
 #[tokio::test]
 async fn reorders_and_requests_resend() {
     let (addr, mut audio_rx) = start().await;
