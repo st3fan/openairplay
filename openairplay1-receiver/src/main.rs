@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 use log::{debug, info};
 
+mod dashboard;
 mod images;
 mod player;
 mod tui;
@@ -31,13 +32,15 @@ struct Args {
     log_file: Option<String>,
     /// Forced terminal-graphics protocol, or `None` to detect one.
     images: Option<Protocol>,
+    /// Address to serve the dashboard WebSocket on; off when `None`.
+    dashboard_listen: Option<String>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: openairplay1-receiver [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
          [--alsa-device DEV] [--no-audio] [--no-avahi] [--tui] [--log-file PATH] \
-         [--tui-images auto|kitty|iterm2|none]"
+         [--tui-images auto|kitty|iterm2|none] [--dashboard-listen ADDR]"
     );
     std::process::exit(2);
 }
@@ -62,6 +65,7 @@ fn parse_args() -> Args {
         tui: false,
         log_file: None,
         images: None,
+        dashboard_listen: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -86,6 +90,9 @@ fn parse_args() -> Args {
             "--no-audio" => args.alsa_device = None,
             "--tui" => args.tui = true,
             "--log-file" => args.log_file = Some(it.next().unwrap_or_else(|| usage())),
+            "--dashboard-listen" => {
+                args.dashboard_listen = Some(it.next().unwrap_or_else(|| usage()))
+            }
             "--tui-images" => {
                 let value = it.next().unwrap_or_else(|| usage());
                 args.images = match value.as_str() {
@@ -215,9 +222,28 @@ async fn main() -> ExitCode {
             None => Box::new(NullSink),
         }
     };
+    // Serve the dashboard socket, if asked for. Bind before streaming starts
+    // so a bad address fails at startup rather than at the first sender.
+    let publisher = match &args.dashboard_listen {
+        Some(addr) => {
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    eprintln!("cannot listen for dashboards on {addr}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            info!("dashboard endpoint: ws://{addr}");
+            let publisher = dashboard::Publisher::new(receiver.config().name.clone());
+            tokio::spawn(dashboard::serve(listener, publisher.clone()));
+            Some(publisher)
+        }
+        None => None,
+    };
+
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-    // Events drive two things: our gain (always) and the display — the log
-    // normally, the TUI when it owns the screen.
+    // Events drive our gain (always), the dashboard socket (when serving),
+    // and the display — the log normally, the TUI when it owns the screen.
     let (ui_tx, ui_rx) = tokio::sync::mpsc::unbounded_channel();
     let tui_mode = args.tui;
     tokio::spawn(async move {
@@ -225,6 +251,9 @@ async fn main() -> ExitCode {
             if let Event::Volume { db } = &event {
                 debug!("volume {db} dB");
                 gain.set(volume_to_gain(*db));
+            }
+            if let Some(publisher) = &publisher {
+                publisher.publish(&event);
             }
             if tui_mode {
                 if ui_tx.send(event).is_err() {

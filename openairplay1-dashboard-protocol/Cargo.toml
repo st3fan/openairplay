@@ -1,0 +1,17 @@
+[package]
+name = "openairplay1-dashboard-protocol"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Wire format for the openairplay1 receiver's dashboard WebSocket"
+license = "MIT"
+repository = "https://github.com/st3fan/openairplay1"
+readme = "../README.md"
+keywords = ["airplay", "raop", "dashboard", "websocket", "protocol"]
+categories = ["multimedia::audio", "encoding"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

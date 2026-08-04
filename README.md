@@ -114,6 +114,7 @@ RUST_LOG=debug ./target/release/openairplay1-receiver
 | `--tui` | — | Full-screen now-playing display instead of log output |
 | `--log-file PATH` | — | Write the log to a file (required to keep logs under `--tui`) |
 | `--tui-images MODE` | `auto` | Terminal graphics for cover art: `auto`, `kitty`, `iterm2`, `none` |
+| `--dashboard-listen ADDR` | — | Serve the now-playing WebSocket on `ADDR` (e.g. `127.0.0.1:7392`) |
 
 Logging is controlled by `RUST_LOG` (`error`/`warn`/`info`/`debug`); it
 defaults to `info`.
@@ -137,6 +138,19 @@ graphics protocol (**Ghostty**, Kitty, WezTerm) or iTerm2 inline images
 (iTerm2, WezTerm, Konsole). The terminal is detected by asking it (and by
 `TERM`/`TERM_PROGRAM` if it doesn't answer); anywhere else the display is
 text-only. `--tui-images kitty|iterm2|none` overrides the choice.
+
+### Dashboard endpoint
+
+`--dashboard-listen 127.0.0.1:7392` publishes what is playing as JSON text
+frames on a WebSocket: a `snapshot` message on connect with everything the
+receiver currently knows, then one message per change (`session_started`,
+`metadata`, `artwork` as base64, `volume`, `progress`, `flushed`,
+`session_ended`). The message types live in
+[`openairplay1-dashboard-protocol`](openairplay1-dashboard-protocol/src/lib.rs).
+
+It is off unless the flag is given, and worth keeping on loopback (or behind a
+reverse proxy): the stream carries now-playing metadata and cover art, and
+there is no authentication.
 
 ## Embedding
 

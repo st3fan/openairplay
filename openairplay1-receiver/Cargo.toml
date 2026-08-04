@@ -23,3 +23,9 @@ futures-util = { version = "0.3.33", default-features = false, features = ["std"
 jpeg-decoder = { version = "0.3.2", default-features = false }
 base64 = "0.23.0"
 libc = "0.2.189"
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+serde_json = "1.0.151"
+openairplay1-dashboard-protocol = { version = "0.2.0", path = "../openairplay1-dashboard-protocol" }
+
+[dev-dependencies]
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake", "connect"] }
