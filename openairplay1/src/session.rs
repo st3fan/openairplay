@@ -260,6 +260,9 @@ impl Session {
         let client_timing = SocketAddr::new(self.peer_ip, timing_port);
         let (flush_tx, flush_rx) = tokio::sync::mpsc::unbounded_channel();
         self.flush_tx = Some(flush_tx);
+        // Retransmitted audio arrives on the control channel; the control task
+        // forwards it to the audio task, which owns the key and the buffer.
+        let (resend_tx, resend_rx) = tokio::sync::mpsc::unbounded_channel();
         self.tasks.push(tokio::spawn(audio_receiver(
             audio,
             params,
@@ -267,10 +270,16 @@ impl Session {
             Some(player_sender),
             control.clone(),
             client_control,
-            flush_rx,
+            AudioInbox {
+                flush: flush_rx,
+                resends: resend_rx,
+            },
         )));
-        self.tasks
-            .push(tokio::spawn(control_receiver(control, clock.clone())));
+        self.tasks.push(tokio::spawn(control_receiver(
+            control,
+            clock.clone(),
+            resend_tx,
+        )));
         self.tasks
             .push(tokio::spawn(timing_task(timing, client_timing, clock)));
 
@@ -440,7 +449,7 @@ async fn audio_receiver(
     player: Option<PlayerSender>,
     control: Arc<UdpSocket>,
     client_control: SocketAddr,
-    mut flush_rx: tokio::sync::mpsc::UnboundedReceiver<Option<u16>>,
+    mut inbox: AudioInbox,
 ) {
     // Real RAOP uses 352-frame packets (~1.4 KiB), but the announced frame
     // length can be larger; 16 KiB holds a 4096-frame 16-bit stereo packet
@@ -486,11 +495,30 @@ async fn audio_receiver(
                 jitter.insert(packet.sequence, frame);
                 drain_deliveries(&mut jitter, &player, &observer, anchor, frames_per_packet);
             }
+            datagram = inbox.resends.recv() => {
+                // A packet we asked for, arriving on the control channel.
+                let Some(datagram) = datagram else { return }; // session dropped
+                let Some(packet) = AudioPacket::parse(&datagram) else {
+                    debug!("audio: unparseable {}-byte resend reply", datagram.len());
+                    continue;
+                };
+                let frame = if params.encrypted {
+                    rtp::decrypt_audio(packet.payload, &params.key, &params.iv)
+                } else {
+                    packet.payload.to_vec()
+                };
+                debug!(
+                    "audio: resend reply seq={} ts={} {} bytes",
+                    packet.sequence, packet.timestamp, frame.len()
+                );
+                jitter.insert(packet.sequence, frame);
+                drain_deliveries(&mut jitter, &player, &observer, anchor, frames_per_packet);
+            }
             _ = service.tick() => {
                 drain_deliveries(&mut jitter, &player, &observer, anchor, frames_per_packet);
                 request_resends(&jitter, &mut resend, &control, client_control).await;
             }
-            flush = flush_rx.recv() => {
+            flush = inbox.flush.recv() => {
                 let Some(flush_to) = flush else { return }; // session dropped
                 debug!("audio: FLUSH to {flush_to:?}");
                 jitter.reset(flush_to);
@@ -577,9 +605,26 @@ async fn request_resends(
     }
 }
 
+/// What the RTSP path and the control task send to the audio task: FLUSH
+/// boundaries (a sequence to flush to, or `None` to re-anchor) and the
+/// retransmitted audio packets that arrive on the control channel.
+struct AudioInbox {
+    flush: tokio::sync::mpsc::UnboundedReceiver<Option<u16>>,
+    resends: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
 /// Read the control channel: parse `0xd4` sync packets and update the clock
-/// model's anchor (the frame at the DAC at a given client-clock instant).
-async fn control_receiver(socket: Arc<UdpSocket>, clock: Arc<Mutex<ClockModel>>) {
+/// model's anchor (the frame at the DAC at a given client-clock instant), and
+/// hand retransmitted audio packets to the audio task.
+///
+/// A sender answers our resend requests **here**, on the control channel — not
+/// on the audio channel — so a reply that stops at this task is a gap the
+/// jitter buffer can never fill.
+async fn control_receiver(
+    socket: Arc<UdpSocket>,
+    clock: Arc<Mutex<ClockModel>>,
+    resends: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+) {
     let mut buf = [0u8; 2048];
     while let Ok(n) = socket.recv(&mut buf).await {
         if let Some(sync) = rtp::parse_sync(&buf[..n]) {
@@ -588,7 +633,14 @@ async fn control_receiver(socket: Arc<UdpSocket>, clock: Arc<Mutex<ClockModel>>)
                 .unwrap()
                 .set_anchor(sync.remote_time_ns, sync.rtp_at_dac);
         } else if let Some(kind) = rtp::classify_control(&buf[..n]) {
-            debug!("control: {kind:?} ({n} bytes)");
+            if kind == rtp::ControlKind::RetransmitResponse {
+                // The audio task owns the session key and the jitter buffer.
+                if resends.send(buf[..n].to_vec()).is_err() {
+                    return; // audio task gone: the session is over
+                }
+            } else {
+                debug!("control: {kind:?} ({n} bytes)");
+            }
         }
     }
 }
