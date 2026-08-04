@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use alsa::pcm::{Access, Format, HwParams, State, PCM};
 use alsa::{Direction, ValueOr};
-use log::{debug, info, warn};
+use log::{debug, warn};
 
 use openairplay1::AudioSink;
 
@@ -106,7 +106,7 @@ impl AlsaSink {
     pub fn open(device: &str, rate: u32, channels: u8, gain: SharedGain) -> AlsaSink {
         let output = match AlsaOutput::open(device, rate, channels as usize) {
             Ok(out) => {
-                info!("player: ALSA \"{device}\" {rate} Hz {channels}ch");
+                debug!("player: ALSA \"{device}\" {rate} Hz {channels}ch");
                 Some(out)
             }
             Err(e) => {

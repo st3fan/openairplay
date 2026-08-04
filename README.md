@@ -13,6 +13,9 @@ audio to it. This repo produces two artifacts:
   macOS. See [Embedding](#embedding).
 - **`openairplay1-receiver`** — the standalone **Linux/ALSA binary** built
   on it: point Control Center (or the AirPlay menu) at it and press play.
+- **`openairplay1-dashboard`** — a **full-screen now-playing display** that
+  connects to a receiver over a WebSocket and draws the current track and its
+  cover art in your terminal. See [Now-playing display](#now-playing-display).
 
 It implements the full RAOP audio path: mDNS discovery, the RTSP handshake
 with the `Apple-Challenge` response, AES/RSA decryption, ALAC decode, a
@@ -111,9 +114,70 @@ RUST_LOG=debug ./target/release/openairplay1-receiver
 | `--alsa-device DEV` | `default` | ALSA output device |
 | `--no-audio` | — | Decode only; don't open an audio device |
 | `--no-avahi` | — | Don't advertise the service |
+| `--log-file PATH` | — | Write the log to a file instead of stderr |
+| `--dashboard-listen ADDR` | — | Serve the now-playing WebSocket on `ADDR` (e.g. `127.0.0.1:7392`) |
 
 Logging is controlled by `RUST_LOG` (`error`/`warn`/`info`/`debug`); it
-defaults to `info`.
+defaults to `info`, which is startup and problems only — everything that
+happens because music is playing (RTSP requests, packet counters, track
+changes) is at `debug`, so a long-running receiver stays quiet.
+
+## Now-playing display
+
+`openairplay1-dashboard` is a separate program: start it, stop it, restart it,
+or run it on another machine, without touching the receiver. It shows the
+current track centered on screen with its cover art, a progress clock, the
+sender's address, the stream format and the volume.
+
+```sh
+# receiver, publishing what it plays
+./target/release/openairplay1-receiver --name "Living Room" \
+    --dashboard-listen 127.0.0.1:7392
+
+# display, in another terminal (or on another machine)
+./target/release/openairplay1-dashboard --connect ws://127.0.0.1:7392
+```
+
+```
+                     Sonata No. 1
+                      Some Artist
+                       Some Album
+
+                ━━━━━━━──────────────
+                    1:23 / 4:07
+
+   Living Room · 192.168.1.42 · 44100 Hz 2ch · -12.5 dB
+```
+
+Cover art is drawn as a real image on terminals that support it — the Kitty
+graphics protocol (**Ghostty**, Kitty, WezTerm) or iTerm2 inline images
+(iTerm2, WezTerm, Konsole). The terminal is detected by asking it (and by
+`TERM`/`TERM_PROGRAM` if it doesn't answer); anywhere else the display is
+text-only. Press `q` (or `Ctrl-C`) to quit.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--connect URL` | `ws://127.0.0.1:7392` | Receiver's dashboard endpoint |
+| `--images MODE` | `auto` | Terminal graphics: `auto`, `kitty`, `iterm2`, `none` |
+| `--log-file PATH` | — | Write the log to a file (the display owns the screen, so logs are otherwise dropped) |
+
+The dashboard reconnects on its own: it can be started before the receiver,
+and it survives the receiver restarting under it, showing the connection state
+in place of a stale screen.
+
+### The endpoint
+
+`--dashboard-listen` publishes what is playing as JSON text frames on a
+WebSocket: a `snapshot` message on connect with everything the receiver
+currently knows, then one message per change (`session_started`, `metadata`,
+`artwork` as base64, `volume`, `progress`, `flushed`, `session_ended`). The
+message types live in
+[`openairplay1-dashboard-protocol`](openairplay1-dashboard-protocol/src/lib.rs),
+so anything that speaks WebSocket — a browser, say — can consume it.
+
+It is off unless the flag is given, and worth keeping on loopback (or behind a
+reverse proxy): the stream carries now-playing metadata and cover art, and
+there is no authentication.
 
 ## Embedding
 
@@ -122,7 +186,7 @@ factory and an event channel, run it on your tokio runtime.
 
 ```toml
 [dependencies]
-openairplay1 = "0.1"
+openairplay1 = "0.2"
 ```
 
 ```rust,no_run
@@ -151,11 +215,15 @@ async fn main() -> std::io::Result<()> {
 The library keeps the session semantics (RTSP handshake, decrypt, jitter
 buffer and retransmits, the NTP clock model, ALAC decode, the prebuffer and
 latency-correct start, FLUSH handling); the host sees only PCM and events —
-`SessionStarted`, `Volume` (in AirPlay dB), `Metadata` (track title, artist,
-album), `Artwork` (cover art bytes as sent), `Flushed`, `SessionEnded`.
-`Metadata` and `Artwork` arrive only between `SessionStarted` and
-`SessionEnded`; each `Metadata` is a complete statement about the current
-track, not a delta, and empty `Artwork` data means the sender cleared it. A
+`SessionStarted` (rate, channels, and the sender's address), `Volume` (in
+AirPlay dB), `Metadata` (track title, artist, album), `Artwork` (cover art
+bytes as sent), `Progress` (position and length as `Duration`s), `Flushed`,
+`SessionEnded`. `Metadata`, `Artwork` and `Progress` arrive only between
+`SessionStarted` and `SessionEnded`; each `Metadata` is a complete statement
+about the current track, not a delta, and empty `Artwork` data means the
+sender cleared it. `Progress` follows the audio being played rather than wall
+time — display it as-is, and note that a paused sender simply stops producing
+it. A
 host that owns its mDNS registration builds with `.advertise(false)` and
 publishes `receiver.txt_records()` itself under
 `receiver.config().service_name()`.
@@ -186,7 +254,14 @@ play the stream. The workspace has two crates:
 
 **`openairplay1-receiver/`** — the binary (PCM → speaker): the CLI plus the
 ALSA sink (blocking `writei`, frame-stuffing drift correction, dB→linear
-gain); it consumes only the library's public API.
+gain) and the dashboard WebSocket; it consumes only the library's public API.
+
+**`openairplay1-dashboard/`** — the display: a WebSocket client with
+reconnect, the ratatui screen, and the Kitty/iTerm2 artwork encoders. It knows
+nothing about AirPlay — only the protocol crate.
+
+**`openairplay1-dashboard-protocol/`** — the message types the receiver and
+the dashboard share (serde only, no I/O).
 
 See [`notes/design.md`](notes/design.md) for the protocol design, and
 `notes/milestone-*.md` for how each part was built and verified.

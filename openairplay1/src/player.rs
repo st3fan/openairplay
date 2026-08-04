@@ -18,11 +18,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use log::{debug, info, warn};
+use log::{debug, warn};
 
 use crate::clock::{self, ClockModel};
 use crate::decode::AlacDecoder;
+use crate::events::{Event, EventSender};
 use crate::sdp::AlacConfig;
+use crate::session::TrackAnchor;
 use crate::sink::AudioSink;
 
 enum Command {
@@ -78,6 +80,8 @@ impl Player {
         config: &AlacConfig,
         sink: Box<dyn AudioSink>,
         clock: Arc<Mutex<ClockModel>>,
+        events: EventSender,
+        track: TrackAnchor,
     ) -> Player {
         let config = *config;
         let prebuffer_packets = prebuffer_packets(&config);
@@ -86,7 +90,18 @@ impl Player {
         let thread_stop = stop.clone();
         let handle = std::thread::Builder::new()
             .name("audio-player".into())
-            .spawn(move || run(config, prebuffer_packets, rx, thread_stop, clock, sink))
+            .spawn(move || {
+                run(
+                    config,
+                    prebuffer_packets,
+                    rx,
+                    thread_stop,
+                    clock,
+                    sink,
+                    events,
+                    track,
+                )
+            })
             .expect("spawn player thread");
         Player {
             tx: Some(tx),
@@ -130,6 +145,7 @@ fn prebuffer_packets(config: &AlacConfig) -> usize {
     (target / frames).max(1) as usize
 }
 
+#[allow(clippy::too_many_arguments)] // the thread body; every argument is one thing it owns
 fn run(
     config: AlacConfig,
     prebuffer_packets: usize,
@@ -137,6 +153,8 @@ fn run(
     stop: Arc<AtomicBool>,
     clock: Arc<Mutex<ClockModel>>,
     mut sink: Box<dyn AudioSink>,
+    events: EventSender,
+    track: TrackAnchor,
 ) {
     let mut decoder = match AlacDecoder::new(&config) {
         Ok(d) => d,
@@ -148,12 +166,13 @@ fn run(
     };
 
     let channels = decoder.channels();
-    info!(
+    debug!(
         "player: {} Hz {}ch, prebuffer {prebuffer_packets} packets",
         config.sample_rate, channels
     );
     let silence_frame = vec![0i16; config.frames_per_packet as usize * channels];
     let mut playout = Playout::new(prebuffer_packets, clock);
+    let mut position = Position::new(config.sample_rate, events, track);
     let mut decoded_packets: u64 = 0;
     while let Ok(command) = rx.recv() {
         // Preempt a queued backlog on teardown rather than draining it in
@@ -175,9 +194,11 @@ fn run(
                     debug!("player: {decoded_packets} packets decoded");
                 }
                 playout.feed(ts, pcm, sink.as_mut());
+                position.played(ts);
             }
             Command::Silence { ts } => {
                 playout.feed(ts, &silence_frame, sink.as_mut());
+                position.played(ts);
             }
             Command::Flush => {
                 playout.reset();
@@ -191,6 +212,71 @@ fn run(
 
 fn drain(rx: Receiver<Command>) {
     while rx.recv().is_ok() {}
+}
+
+/// Reports where playback is, from the audio itself.
+///
+/// The sender's own `progress:` line arrives about once per track — one
+/// capture showed a 251-second track play to its end with no further report —
+/// so a display that wants a running clock has to get it from somewhere else.
+/// The somewhere else is here: every packet carries the RTP timestamp of the
+/// audio being played, and the sender told us where the track starts and ends
+/// on that same timeline.
+///
+/// It falls out of this that **a paused sender freezes the clock**: no audio
+/// means no packets, which means nothing to report, and the last position
+/// stands until playback resumes. Nothing has to detect the pause.
+struct Position {
+    rate: u32,
+    events: EventSender,
+    track: TrackAnchor,
+    /// Whole seconds last reported, so a report is one per second rather than
+    /// one per 8 ms packet.
+    reported: Option<u64>,
+}
+
+impl Position {
+    fn new(rate: u32, events: EventSender, track: TrackAnchor) -> Position {
+        Position {
+            rate,
+            events,
+            track,
+            reported: None,
+        }
+    }
+
+    /// Note that the audio at `ts` is playing, and report the position when
+    /// the displayed second changes.
+    fn played(&mut self, ts: u32) {
+        let Some(track) = *self.track.lock().unwrap() else {
+            return; // the sender hasn't said where the track starts
+        };
+        let Some((elapsed, duration)) = extent(track, ts, self.rate) else {
+            return;
+        };
+        let second = elapsed.as_secs();
+        if self.reported == Some(second) {
+            return;
+        }
+        self.reported = Some(second);
+        let _ = self.events.send(Event::Progress { elapsed, duration });
+    }
+}
+
+/// Where `ts` sits within `track`, or `None` if it sits outside it — which
+/// happens between a track change and the sender's next `progress:`, when the
+/// audio has moved on but the anchor hasn't.
+fn extent(track: crate::session::Track, ts: u32, rate: u32) -> Option<(Duration, Duration)> {
+    if rate == 0 {
+        return None;
+    }
+    let played = ts.wrapping_sub(track.start);
+    let total = track.end.wrapping_sub(track.start);
+    if played > total {
+        return None;
+    }
+    let frames = |f: u32| Duration::from_secs_f64(f as f64 / rate as f64);
+    Some((frames(played), frames(total)))
 }
 
 /// Drives the transition from prebuffering to steady playback: a
@@ -236,19 +322,19 @@ impl Playout {
         };
         let target = self.clock.lock().unwrap().play_time(first_ts);
         let Some(target) = target else {
-            info!("player: start via prebuffer (no clock sync yet)");
+            debug!("player: start via prebuffer (no clock sync yet)");
             return;
         };
         let now = clock::now_ns();
         if target > now {
             let wait = (target - now).min(2_000_000_000); // cap the wait at 2 s
-            info!(
+            debug!(
                 "player: latency-correct start, waiting {} ms",
                 wait / 1_000_000
             );
             std::thread::sleep(Duration::from_nanos(wait));
         } else {
-            info!("player: latency-correct start (already due, no wait)");
+            debug!("player: latency-correct start (already due, no wait)");
         }
     }
 
@@ -304,6 +390,7 @@ impl Prebuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::Track;
     use std::sync::atomic::AtomicUsize;
 
     /// Records every delivered chunk and every flush.
@@ -349,6 +436,130 @@ mod tests {
         panic!("player did not settle");
     }
 
+    /// The position reports the playback thread produced for `packets`
+    /// packets of a track anchored at `start`..`end`.
+    fn positions(track: Option<Track>, packets: u32) -> Vec<(f64, f64)> {
+        let config = golden_config();
+        let clock = Arc::new(Mutex::new(ClockModel::new(config.sample_rate)));
+        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let recorder = Recorder::default();
+        let writes = recorder.writes.clone();
+        let player = Player::spawn(
+            &config,
+            Box::new(recorder),
+            clock,
+            events,
+            Arc::new(Mutex::new(track)),
+        );
+        let sender = player.sender();
+        let packet = golden_packet();
+        for i in 0..packets {
+            sender.frame(i * config.frames_per_packet, packet.clone());
+        }
+        settle(|| !writes.lock().unwrap().is_empty());
+        drop(player);
+
+        let mut out = Vec::new();
+        while let Ok(Event::Progress { elapsed, duration }) = rx.try_recv() {
+            out.push((elapsed.as_secs_f64(), duration.as_secs_f64()));
+        }
+        out
+    }
+
+    #[test]
+    fn playback_reports_its_position_once_a_second() {
+        // A five-minute track starting at RTP 0. The golden packet is 4096
+        // frames, so ~11 packets per second at 44.1 kHz.
+        let track = Track {
+            start: 0,
+            end: 300 * 44100,
+        };
+        let reports = positions(Some(track), 40);
+        assert!(!reports.is_empty(), "playback should report where it is");
+        assert!(
+            reports
+                .iter()
+                .all(|(_, total)| (*total - 300.0).abs() < 0.01),
+            "the track length comes from the sender's anchor: {reports:?}"
+        );
+        // One report per second of audio, not one per packet.
+        assert!(
+            reports.len() <= 5,
+            "40 packets is under 4 seconds of audio: {reports:?}"
+        );
+        // And the position advances with the audio.
+        let elapsed: Vec<f64> = reports.iter().map(|(e, _)| *e).collect();
+        assert!(
+            elapsed.windows(2).all(|w| w[1] > w[0]),
+            "position must advance: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn no_anchor_means_no_position_reports() {
+        // Before the sender's first `progress:` we have no idea where in the
+        // track the audio is, and saying nothing beats guessing.
+        assert!(positions(None, 40).is_empty());
+    }
+
+    #[test]
+    fn audio_outside_the_anchored_track_is_not_reported() {
+        // Right after a track change the audio has moved past the old track's
+        // end, and the sender's new anchor hasn't arrived yet.
+        let stale = Track {
+            start: 0,
+            end: 4096, // one packet long
+        };
+        let reports = positions(Some(stale), 40);
+        assert!(
+            reports.iter().all(|(elapsed, total)| elapsed <= total),
+            "never report a position past the end of the track: {reports:?}"
+        );
+    }
+
+    #[test]
+    fn position_stops_when_the_audio_does() {
+        // The pause case, which needs no pause detection at all: no packets,
+        // no reports, so whatever the host last heard stands.
+        let track = Track {
+            start: 0,
+            end: 300 * 44100,
+        };
+        let config = golden_config();
+        let clock = Arc::new(Mutex::new(ClockModel::new(config.sample_rate)));
+        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let recorder = Recorder::default();
+        let writes = recorder.writes.clone();
+        let player = Player::spawn(
+            &config,
+            Box::new(recorder),
+            clock,
+            events,
+            Arc::new(Mutex::new(Some(track))),
+        );
+        let sender = player.sender();
+        let packet = golden_packet();
+        for i in 0..40 {
+            sender.frame(i * config.frames_per_packet, packet.clone());
+        }
+        // Wait for the queue to actually drain: audio still in flight is not
+        // a pause, it is a backlog.
+        settle(|| writes.lock().unwrap().len() >= 39);
+        while rx.try_recv().is_ok() {} // drain what playing produced
+
+        // The sender pauses: nothing arrives.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            rx.try_recv().is_err(),
+            "a paused stream must produce no position reports"
+        );
+
+        // And resuming picks up again.
+        sender.frame(60 * config.frames_per_packet, packet);
+        settle(|| !rx.is_empty());
+        assert!(matches!(rx.try_recv(), Ok(Event::Progress { .. })));
+    }
+
     #[test]
     fn prebuffer_holds_until_threshold_then_releases() {
         let mut pb = Prebuffer::new(3);
@@ -392,7 +603,14 @@ mod tests {
         let recorder = Recorder::default();
         let writes = recorder.writes.clone();
         let clock = Arc::new(Mutex::new(ClockModel::new(config.sample_rate)));
-        let player = Player::spawn(&config, Box::new(recorder), clock);
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let player = Player::spawn(
+            &config,
+            Box::new(recorder),
+            clock,
+            events,
+            Arc::new(Mutex::new(None)),
+        );
         let sender = player.sender();
 
         for i in 0..prebuffer {
@@ -416,7 +634,14 @@ mod tests {
         let writes = recorder.writes.clone();
         let flushes = recorder.flushes.clone();
         let clock = Arc::new(Mutex::new(ClockModel::new(config.sample_rate)));
-        let player = Player::spawn(&config, Box::new(recorder), clock);
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let player = Player::spawn(
+            &config,
+            Box::new(recorder),
+            clock,
+            events,
+            Arc::new(Mutex::new(None)),
+        );
         let sender = player.sender();
 
         // Below the prebuffer threshold: nothing can have played yet.
@@ -452,7 +677,14 @@ mod tests {
         let recorder = Recorder::default();
         let writes = recorder.writes.clone();
         let clock = Arc::new(Mutex::new(ClockModel::new(config.sample_rate)));
-        let player = Player::spawn(&config, Box::new(recorder), clock);
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let player = Player::spawn(
+            &config,
+            Box::new(recorder),
+            clock,
+            events,
+            Arc::new(Mutex::new(None)),
+        );
         let sender = player.sender();
 
         for i in 0..prebuffer - 1 {

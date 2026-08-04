@@ -9,7 +9,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use log::{debug, info, warn};
+use log::{debug, warn};
 use tokio::io::BufReader;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -52,11 +52,11 @@ pub async fn serve_with_observer(
         let observer = observer.clone();
         let slot = slot.clone();
         tokio::spawn(async move {
-            info!("[{peer}] connected");
+            debug!("[{peer}] connected");
             if let Err(e) = handle_connection(stream, peer, context, observer, slot).await {
                 warn!("[{peer}] connection error: {e}");
             }
-            info!("[{peer}] disconnected");
+            debug!("[{peer}] disconnected");
         });
     }
 }
@@ -89,7 +89,7 @@ async fn handle_connection(
 }
 
 fn log_request(peer: &SocketAddr, request: &Request) {
-    info!("[{peer}] {} {}", request.method, request.uri);
+    debug!("[{peer}] {} {}", request.method, request.uri);
     for (name, value) in request.headers.iter() {
         debug!("[{peer}]   {name}: {value}");
     }

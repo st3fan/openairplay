@@ -1,3 +1,8 @@
 [workspace]
-members = ["openairplay1", "openairplay1-receiver"]
+members = [
+    "openairplay1",
+    "openairplay1-dashboard",
+    "openairplay1-dashboard-protocol",
+    "openairplay1-receiver",
+]
 resolver = "2"

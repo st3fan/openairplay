@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 use log::{debug, info};
 
+mod dashboard;
 mod player;
 
 use crate::player::{volume_to_gain, AlsaSink, NullSink, SharedGain};
@@ -21,12 +22,17 @@ struct Args {
     avahi: bool,
     /// ALSA device, or `None` for `--no-audio`.
     alsa_device: Option<String>,
+    /// Where log output goes; stderr when `None`.
+    log_file: Option<String>,
+    /// Address to serve the dashboard WebSocket on; off when `None`.
+    dashboard_listen: Option<String>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: openairplay1-receiver [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
-         [--alsa-device DEV] [--no-audio] [--no-avahi]"
+         [--alsa-device DEV] [--no-audio] [--no-avahi] [--log-file PATH] \
+         [--dashboard-listen ADDR]"
     );
     std::process::exit(2);
 }
@@ -48,6 +54,8 @@ fn parse_args() -> Args {
         mac: None,
         avahi: true,
         alsa_device: Some(DEFAULT_ALSA_DEVICE.to_string()),
+        log_file: None,
+        dashboard_listen: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -70,6 +78,10 @@ fn parse_args() -> Args {
             }
             "--alsa-device" => args.alsa_device = Some(it.next().unwrap_or_else(|| usage())),
             "--no-audio" => args.alsa_device = None,
+            "--log-file" => args.log_file = Some(it.next().unwrap_or_else(|| usage())),
+            "--dashboard-listen" => {
+                args.dashboard_listen = Some(it.next().unwrap_or_else(|| usage()))
+            }
             "--no-avahi" => args.avahi = false,
             "-h" | "--help" => usage(),
             other => {
@@ -81,10 +93,69 @@ fn parse_args() -> Args {
     args
 }
 
+/// Point the logger at the right sink: `--log-file` if given, else stderr.
+fn init_logging(args: &Args) -> Result<(), String> {
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    if let Some(path) = &args.log_file {
+        let file = std::fs::File::create(path)
+            .map_err(|e| format!("cannot write log file {path:?}: {e}"))?;
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
+    }
+    builder.init();
+    Ok(())
+}
+
+/// One line per event, at debug: with a sender streaming these arrive
+/// several times a second, and the receiver's `info` log is meant to stay
+/// readable — the dashboard is where now-playing detail belongs.
+fn log_event(event: Event) {
+    match event {
+        Event::SessionStarted {
+            rate,
+            channels,
+            peer,
+            ..
+        } => debug!("session started ({rate} Hz, {channels}ch) from {peer}"),
+        Event::Progress { elapsed, duration } => debug!(
+            "progress {:.0}s / {:.0}s",
+            elapsed.as_secs_f32(),
+            duration.as_secs_f32()
+        ),
+        Event::Metadata {
+            title,
+            artist,
+            album,
+        } => {
+            let unknown = || "?".to_string();
+            debug!(
+                "now playing: {} — {} ({})",
+                artist.unwrap_or_else(unknown),
+                title.unwrap_or_else(unknown),
+                album.unwrap_or_else(unknown)
+            );
+        }
+        Event::Artwork { content_type, data } => {
+            if data.is_empty() {
+                debug!("artwork cleared ({content_type})");
+            } else {
+                debug!("artwork: {content_type}, {} bytes", data.len());
+            }
+        }
+        Event::SessionEnded => debug!("session ended"),
+        Event::Flushed => debug!("flushed"),
+        // Volume is logged where the gain is applied.
+        _ => {}
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = parse_args();
+    if let Err(e) = init_logging(&args) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
 
     let mut builder = Receiver::builder().advertise(args.avahi);
     if let Some(name) = args.name {
@@ -127,41 +198,38 @@ async fn main() -> ExitCode {
             None => Box::new(NullSink),
         }
     };
+    // Serve the dashboard socket, if asked for. Bind before streaming starts
+    // so a bad address fails at startup rather than at the first sender.
+    let publisher = match &args.dashboard_listen {
+        Some(addr) => {
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    eprintln!("cannot listen for dashboards on {addr}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            info!("dashboard endpoint: ws://{addr}");
+            let publisher = dashboard::Publisher::new(receiver.config().name.clone());
+            tokio::spawn(dashboard::serve(listener, publisher.clone()));
+            Some(publisher)
+        }
+        None => None,
+    };
+
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Events drive our gain (always), the dashboard socket (when serving),
+    // and the log.
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
-            match event {
-                Event::Volume { db } => {
-                    debug!("volume {db} dB");
-                    gain.set(volume_to_gain(db));
-                }
-                Event::SessionStarted { rate, channels } => {
-                    info!("session started ({rate} Hz, {channels}ch)");
-                }
-                Event::Metadata {
-                    title,
-                    artist,
-                    album,
-                } => {
-                    let unknown = || "?".to_string();
-                    info!(
-                        "now playing: {} — {} ({})",
-                        artist.unwrap_or_else(unknown),
-                        title.unwrap_or_else(unknown),
-                        album.unwrap_or_else(unknown)
-                    );
-                }
-                Event::Artwork { content_type, data } => {
-                    if data.is_empty() {
-                        info!("artwork cleared ({content_type})");
-                    } else {
-                        info!("artwork: {content_type}, {} bytes", data.len());
-                    }
-                }
-                Event::SessionEnded => info!("session ended"),
-                Event::Flushed => debug!("flushed"),
-                _ => {}
+            if let Event::Volume { db } = &event {
+                debug!("volume {db} dB");
+                gain.set(volume_to_gain(*db));
             }
+            if let Some(publisher) = &publisher {
+                publisher.publish(&event);
+            }
+            log_event(event);
         }
     });
 

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
-use log::{debug, info, warn};
+use log::{debug, warn};
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 
@@ -61,6 +61,20 @@ impl Drop for SlotGuard {
     }
 }
 
+/// The current track's boundaries as RTP timestamps, from the sender's
+/// `progress:` line. Shared with the playback thread, which is the only place
+/// that knows how far into the track the audio actually is.
+pub type TrackAnchor = Arc<Mutex<Option<Track>>>;
+
+/// One track's extent on the RTP timeline.
+#[derive(Debug, Clone, Copy)]
+pub struct Track {
+    /// RTP timestamp where the track starts.
+    pub start: u32,
+    /// RTP timestamp where it ends.
+    pub end: u32,
+}
+
 /// A decrypted audio packet, surfaced to an optional observer (the
 /// integration tests use it to prove the crypto path; production passes no
 /// observer).
@@ -99,6 +113,9 @@ pub struct Session {
     /// True between SETUP and TEARDOWN/drop; guards the one-time
     /// [`Event::SessionEnded`].
     streaming: bool,
+    /// The current track's RTP extent, handed to the playback thread so it
+    /// can report where playback really is.
+    track: TrackAnchor,
     /// Metadata/artwork that arrived while no session was active (senders
     /// may push them earlier in the handshake, before SETUP). The latest of
     /// each is latched here and delivered right after `SessionStarted`, so
@@ -133,6 +150,7 @@ impl Session {
             sink_factory,
             events,
             streaming: false,
+            track: Arc::new(Mutex::new(None)),
             pending_metadata: None,
             pending_artwork: None,
             player: None,
@@ -162,7 +180,7 @@ impl Session {
 
         let params = match (sdp.rsaaeskey.as_deref(), sdp.aesiv.as_deref()) {
             (None, None) => {
-                info!("ANNOUNCE: unencrypted stream, {} Hz", alac.sample_rate);
+                debug!("ANNOUNCE: unencrypted stream, {} Hz", alac.sample_rate);
                 StreamParams {
                     encrypted: false,
                     key: [0; 16],
@@ -172,7 +190,7 @@ impl Session {
             }
             (Some(rsaaeskey), Some(aesiv)) => match decrypt_stream_key(rsaaeskey, aesiv) {
                 Ok((key, iv)) => {
-                    info!("ANNOUNCE: encrypted stream, {} Hz", alac.sample_rate);
+                    debug!("ANNOUNCE: encrypted stream, {} Hz", alac.sample_rate);
                     StreamParams {
                         encrypted: true,
                         key,
@@ -241,7 +259,7 @@ impl Session {
         self.local_control_port = control.local_addr().map(|a| a.port()).unwrap_or(0);
         self.local_timing_port = timing.local_addr().map(|a| a.port()).unwrap_or(0);
 
-        info!(
+        debug!(
             "SETUP: client control={control_port} timing={timing_port}; \
              ours audio={} control={} timing={}",
             self.local_audio_port, self.local_control_port, self.local_timing_port
@@ -256,6 +274,7 @@ impl Session {
         self.send_event(Event::SessionStarted {
             rate: params.alac.sample_rate,
             channels: params.alac.channels,
+            peer: self.peer_ip,
         });
         self.streaming = true;
         // Replay metadata/artwork that arrived before the session started,
@@ -265,7 +284,13 @@ impl Session {
             self.send_event(event);
         }
         let sink = (self.sink_factory)(params.alac.sample_rate, params.alac.channels);
-        let player = Player::spawn(&params.alac, sink, clock.clone());
+        let player = Player::spawn(
+            &params.alac,
+            sink,
+            clock.clone(),
+            self.events.clone(),
+            self.track.clone(),
+        );
         let player_sender = player.sender();
         self.player = Some(player);
 
@@ -317,7 +342,7 @@ impl Session {
                 .split(';')
                 .find_map(|kv| kv.trim().strip_prefix("rtptime="))
                 .and_then(|v| v.parse::<u32>().ok());
-            info!("RECORD: initial seq={seq:?} rtptime={rtptime:?}");
+            debug!("RECORD: initial seq={seq:?} rtptime={rtptime:?}");
         }
         Response::ok().header("Audio-Latency", "11025")
     }
@@ -332,7 +357,7 @@ impl Session {
                 self.flush_tx = None;
                 self.slot_guard = None; // release the streaming slot immediately
                 self.end_session();
-                info!("TEARDOWN: session closed");
+                debug!("TEARDOWN: session closed");
                 Some(Response::ok())
             }
             "FLUSH" => {
@@ -376,18 +401,56 @@ impl Session {
         }
     }
 
-    /// The `text/parameters` flavor — currently just the volume line. The
-    /// library does not apply gain; the host owns that path.
+    /// The `text/parameters` flavor: the volume line and the playback
+    /// position. The library does not apply gain; the host owns that path.
     fn set_text_parameters(&mut self, body: &[u8]) {
         let text = String::from_utf8_lossy(body);
         for line in text.lines() {
-            if let Some(v) = line.trim().strip_prefix("volume:") {
+            let line = line.trim();
+            if let Some(v) = line.strip_prefix("volume:") {
                 if let Ok(db) = v.trim().parse::<f32>() {
                     debug!("SET_PARAMETER volume {db} dB");
                     self.send_event(Event::Volume { db });
                 }
+            } else if let Some(v) = line.strip_prefix("progress:") {
+                self.set_progress(v.trim());
             }
         }
+    }
+
+    /// `progress: <start>/<current>/<end>` — three RTP timestamps. Converted
+    /// to durations with the stream's sample rate so no wire concept reaches
+    /// the host; reported only while a session is running, since a position
+    /// without a stream means nothing.
+    fn set_progress(&mut self, value: &str) {
+        let Some(params) = &self.params else { return };
+        if !self.streaming {
+            return;
+        }
+        let rate = params.alac.sample_rate;
+        let mut parts = value.split('/').map(|p| p.trim().parse::<u32>());
+        let (Some(Ok(start)), Some(Ok(current)), Some(Ok(end)), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            debug!("SET_PARAMETER progress: unparseable value {value:?}");
+            return;
+        };
+        // The sender tells us where the track begins and ends on the RTP
+        // timeline; the playback thread turns that into a position that
+        // actually follows the audio.
+        *self.track.lock().unwrap() = Some(Track { start, end });
+
+        // RTP timestamps wrap and a seek can put `current` before `start`;
+        // saturating subtraction keeps both readings sane rather than
+        // reporting a position of ~27 hours.
+        let elapsed = frames_to_duration(current.saturating_sub(start), rate);
+        let duration = frames_to_duration(end.saturating_sub(start), rate);
+        debug!(
+            "SET_PARAMETER progress {:.1}s / {:.1}s",
+            elapsed.as_secs_f32(),
+            duration.as_secs_f32()
+        );
+        self.send_event(Event::Progress { elapsed, duration });
     }
 
     /// DMAP track metadata. Metadata is decoration: an unparseable payload
@@ -442,6 +505,7 @@ impl Session {
 
     /// Report [`Event::SessionEnded`] once per started session.
     fn end_session(&mut self) {
+        *self.track.lock().unwrap() = None;
         if self.streaming {
             self.streaming = false;
             self.send_event(Event::SessionEnded);
@@ -460,6 +524,14 @@ impl Drop for Session {
         self.stop_tasks();
         self.end_session();
     }
+}
+
+/// Convert a frame count at `rate` Hz to a wall-clock duration.
+fn frames_to_duration(frames: u32, rate: u32) -> Duration {
+    if rate == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64(frames as f64 / rate as f64)
 }
 
 /// Decrypt the AES key (RSA-OAEP) and decode the IV (base64, 16 bytes).
@@ -575,7 +647,7 @@ async fn audio_receiver(
                     packet.payload.to_vec()
                 };
                 if received <= 3 || received.is_multiple_of(250) {
-                    info!(
+                    debug!(
                         "audio: {received} pkts, seq={} ts={} {} bytes",
                         packet.sequence, packet.timestamp, frame.len()
                     );
@@ -853,7 +925,8 @@ mod tests {
             events.try_recv(),
             Ok(Event::SessionStarted {
                 rate: 44100,
-                channels: 2
+                channels: 2,
+                peer: IpAddr::V4(Ipv4Addr::LOCALHOST),
             })
         );
 
@@ -903,7 +976,8 @@ mod tests {
             events.try_recv(),
             Ok(Event::SessionStarted {
                 rate: 44100,
-                channels: 2
+                channels: 2,
+                peer: IpAddr::V4(Ipv4Addr::LOCALHOST),
             })
         );
 
@@ -956,7 +1030,8 @@ mod tests {
             events.try_recv(),
             Ok(Event::SessionStarted {
                 rate: 44100,
-                channels: 2
+                channels: 2,
+                peer: IpAddr::V4(Ipv4Addr::LOCALHOST),
             })
         );
     }
@@ -1005,6 +1080,79 @@ mod tests {
         // Anything else is acknowledged but produces no event.
         session.set_parameter(Some("application/octet-stream"), b"\x00\x01");
         assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn progress_is_reported_as_durations() {
+        let (mut session, mut events) = session();
+        start_session(&mut session, &mut events).await;
+
+        // start/current/end as RTP timestamps at 44100 Hz: 10 s in, 180 s
+        // long. Senders send this line on its own or next to the volume.
+        session.set_parameter(
+            Some("text/parameters"),
+            b"progress: 1000/442000/7939000\r\n",
+        );
+        let Ok(Event::Progress { elapsed, duration }) = events.try_recv() else {
+            panic!("expected a Progress event");
+        };
+        assert!(
+            (elapsed.as_secs_f64() - 10.0).abs() < 0.01,
+            "elapsed was {elapsed:?}"
+        );
+        assert!(
+            (duration.as_secs_f64() - 180.0).abs() < 0.01,
+            "duration was {duration:?}"
+        );
+
+        // A seek backwards past the anchor, and a stream with no known end,
+        // must not produce a ~27-hour reading from a wrapped subtraction.
+        session.set_parameter(Some("text/parameters"), b"progress: 5000/1000/5000");
+        assert_eq!(
+            events.try_recv(),
+            Ok(Event::Progress {
+                elapsed: Duration::ZERO,
+                duration: Duration::ZERO,
+            })
+        );
+
+        // Malformed values are ignored, and the volume line in the same body
+        // still works.
+        for bad in [
+            "progress: 1/2\r\n",
+            "progress: 1/2/3/4\r\n",
+            "progress: a/b/c\r\n",
+            "progress:\r\n",
+        ] {
+            session.set_parameter(Some("text/parameters"), bad.as_bytes());
+        }
+        assert!(events.try_recv().is_err(), "no event from bad progress");
+
+        session.set_parameter(
+            Some("text/parameters"),
+            b"volume: -8.0\r\nprogress: 1000/45100/7939000\r\n",
+        );
+        assert_eq!(events.try_recv(), Ok(Event::Volume { db: -8.0 }));
+        assert!(matches!(events.try_recv(), Ok(Event::Progress { .. })));
+    }
+
+    #[tokio::test]
+    async fn progress_outside_a_session_is_dropped() {
+        // A position without a stream means nothing, and before ANNOUNCE
+        // there is no sample rate to convert it with.
+        let (mut session, mut events) = session();
+        session.set_parameter(Some("text/parameters"), b"progress: 1000/442000/7939000");
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn session_started_carries_the_sender_address() {
+        let (mut session, mut events) = session();
+        start_session(&mut session, &mut events).await; // asserts peer
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

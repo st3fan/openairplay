@@ -135,7 +135,8 @@ async fn start_session(
         next_event(events).await,
         Event::SessionStarted {
             rate: 44100,
-            channels: 2
+            channels: 2,
+            ..
         }
     ));
 }
