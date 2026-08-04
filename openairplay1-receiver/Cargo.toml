@@ -6,6 +6,7 @@ rust-version = "1.87"
 description = "Standalone AirPlay 1 (RAOP) receiver for Linux/ALSA"
 license = "MIT"
 repository = "https://github.com/st3fan/openairplay1"
+readme = "../README.md"
 keywords = ["airplay", "airplay1", "raop", "audio", "receiver", "alsa"]
 categories = ["multimedia::audio", "command-line-utilities"]
 
