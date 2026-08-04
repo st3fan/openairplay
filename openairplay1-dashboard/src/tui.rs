@@ -80,6 +80,10 @@ pub struct Artwork {
 pub struct NowPlaying {
     /// Where we are connecting to, shown until a receiver answers.
     endpoint: String,
+    /// What this terminal can draw. A terminal with no graphics support gets
+    /// no artwork box at all — an empty gap above the text would just be a
+    /// hole where a picture isn't.
+    images: Protocol,
     connection: Connection,
     /// The receiver's advertised name, from its snapshot.
     name: String,
@@ -93,11 +97,18 @@ pub struct NowPlaying {
 }
 
 impl NowPlaying {
-    pub fn new(endpoint: String) -> NowPlaying {
+    pub fn new(endpoint: String, images: Protocol) -> NowPlaying {
         NowPlaying {
             endpoint,
+            images,
             ..NowPlaying::default()
         }
+    }
+
+    /// Is there artwork *and* a way to draw it? Both halves matter: the box
+    /// is only worth reserving if a picture will land in it.
+    fn shows_artwork(&self) -> bool {
+        self.artwork.is_some() && self.images != Protocol::None
     }
 
     /// Fold one client update into the display state.
@@ -275,12 +286,8 @@ impl NowPlaying {
     pub fn render(&self, frame: &mut Frame, cell_aspect: f32) -> Rect {
         let area = frame.area();
         let lines = self.lines(area.width);
-        let (artwork_area, text_area) = layout(
-            area,
-            lines.len() as u16,
-            self.artwork.is_some(),
-            cell_aspect,
-        );
+        let (artwork_area, text_area) =
+            layout(area, lines.len() as u16, self.shows_artwork(), cell_aspect);
         frame.render_widget(
             Paragraph::new(lines).alignment(Alignment::Center),
             text_area,
@@ -516,7 +523,7 @@ async fn event_loop(
     images: Protocol,
     cell_aspect: f32,
 ) -> std::io::Result<Exit> {
-    let mut state = NowPlaying::new(endpoint);
+    let mut state = NowPlaying::new(endpoint, images);
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(TICK);
     // Raw mode means the terminal sends no SIGINT, but `kill` and systemd
@@ -603,7 +610,7 @@ mod tests {
 
     /// Connected, with the receiver's snapshot but nothing playing.
     fn connected() -> NowPlaying {
-        let mut state = NowPlaying::new("ws://127.0.0.1:7392".into());
+        let mut state = NowPlaying::new("ws://127.0.0.1:7392".into(), Protocol::Kitty);
         state.apply(Update::Connected);
         state.apply(msg(Message::Snapshot(
             openairplay1_dashboard_protocol::Snapshot {
@@ -646,7 +653,7 @@ mod tests {
     fn before_a_receiver_answers_the_screen_says_so() {
         // A stale screen must never be mistaken for live state, so the
         // connection state replaces the track entirely.
-        let state = NowPlaying::new("ws://127.0.0.1:7392".into());
+        let state = NowPlaying::new("ws://127.0.0.1:7392".into(), Protocol::Kitty);
         let screen = draw(&state, 44, 10);
         assert!(screen.contains("ws://127.0.0.1:7392"), "{screen}");
         assert!(screen.contains("connecting"), "{screen}");
@@ -673,7 +680,7 @@ mod tests {
     fn a_snapshot_fills_the_screen_in_one_go() {
         // What a dashboard started mid-track gets: everything at once.
         use openairplay1_dashboard_protocol as proto;
-        let mut state = NowPlaying::new("ws://host:7392".into());
+        let mut state = NowPlaying::new("ws://host:7392".into(), Protocol::Kitty);
         state.apply(Update::Connected);
         state.apply(msg(Message::Snapshot(proto::Snapshot {
             receiver: proto::ReceiverInfo {
@@ -793,6 +800,60 @@ mod tests {
         // Narrower and shorter than the content: no panic, no overflow.
         let screen = draw(&playing(), 12, 4);
         assert!(!screen.is_empty());
+    }
+
+    /// The vertical middle of the text block on screen, so "centered" can be
+    /// asserted rather than eyeballed.
+    fn text_rows(screen: &str) -> Vec<usize> {
+        screen
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(row, _)| row)
+            .collect()
+    }
+
+    #[test]
+    fn without_terminal_graphics_the_text_is_centered_on_the_screen() {
+        // A terminal that can't draw images must not get a hole above the
+        // text where a picture isn't.
+        let mut state = playing();
+        state.images = Protocol::None;
+        state.apply(msg(Message::Artwork {
+            content_type: "image/jpeg".into(),
+            data_base64: STANDARD.encode([1, 2, 3]),
+        }));
+        assert!(state.artwork.is_some(), "the artwork is still held");
+
+        let height = 21;
+        let screen = draw(&state, 60, height);
+        let rows = text_rows(&screen);
+        let (first, last) = (rows[0], rows[rows.len() - 1]);
+        let above = first;
+        let below = height as usize - 1 - last;
+        assert!(
+            above.abs_diff(below) <= 1,
+            "text should sit in the middle: {above} rows above, {below} below\n{screen}"
+        );
+    }
+
+    #[test]
+    fn with_terminal_graphics_the_text_makes_room_for_the_artwork() {
+        // The same state on a terminal that can draw: the picture's box comes
+        // out of the space above, so the text sits lower.
+        let mut state = playing();
+        state.images = Protocol::Kitty;
+        state.apply(msg(Message::Artwork {
+            content_type: "image/jpeg".into(),
+            data_base64: STANDARD.encode([1, 2, 3]),
+        }));
+        let with_art = text_rows(&draw(&state, 60, 21))[0];
+        state.images = Protocol::None;
+        let without_art = text_rows(&draw(&state, 60, 21))[0];
+        assert!(
+            with_art > without_art,
+            "artwork should push the text down ({with_art} vs {without_art})"
+        );
     }
 
     #[test]
