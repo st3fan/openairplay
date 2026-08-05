@@ -21,10 +21,16 @@ dependencies resolved **from the registry, not the workspace**, so a
 dependent cannot be published before what it depends on is up. The
 workflow publishes in the order above and cargo waits for the index.
 
-The publish step **skips any crate whose version is already on
-crates.io**. That makes a re-pushed tag safe after a partial failure,
-and lets a crate that had to be published by hand pass through
-untouched (see below).
+The publish step **tolerates a crate whose version is already on
+crates.io**: cargo's "already exists on crates.io index" is treated as
+success and the run continues. That makes a re-pushed tag safe after a
+partial failure, and lets a crate that had to be published by hand pass
+through untouched (see below).
+
+Cargo is what gets asked, not the crates.io API — a plain `curl -I` to
+`/api/v1/crates/…` answers **403**, and the first version of this
+workflow used exactly that, so it decided nothing was published and
+then died on the first crate that was.
 
 ## One-time setup, per crate
 
