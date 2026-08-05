@@ -35,9 +35,15 @@ A cargo workspace with four members:
   say) may be reading it.
 
 Deliberate scope: **one sender → one stream → one output** (a second sender is refused `453`).
-Also out of scope: `PAUSE` (answered `501`), DACP transport control, password protection,
+Also out of scope: `PAUSE` (answered `501`), DACP transport control,
 AirPlay 2 (HomeKit pairing, PTP multi-room), video/screen mirroring. The dashboard socket is
 read-only and unauthenticated by design — loopback by default, reverse proxy for anything else.
+
+**Pincode protection** (optional) is plumbed through the library's `Config`/builder
+(`.pincode(..)`) and the receiver's `--pincode`, advertising `pw=1`; the enforcement gate at
+SETUP is a separate phase and not wired up yet. The pincode protects *streaming only* — it
+does **not** protect the dashboard socket (that stays unauthenticated loopback), and it never
+appears in logs, responses, or the advertisement.
 
 ## Build, test, run
 

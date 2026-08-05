@@ -31,6 +31,7 @@ async fn start_server() -> SocketAddr {
         name: "Test".to_string(),
         port: addr.port(),
         mac: MAC,
+        pincode: None,
     };
     let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel();
     let context = Arc::new(Context {
