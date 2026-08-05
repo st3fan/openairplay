@@ -1,4 +1,4 @@
-//! Pincode protection (classic AirPlay 1 password, RFC 2617 Digest auth):
+//! Password protection (classic AirPlay 1 password, RFC 2617 Digest auth):
 //! drive the real RTSP server over TCP and verify the challenge / authorize
 //! / refuse cycle, mirroring how shairport-sync's `rtsp_classic_airplay_auth`
 //! behaves.
@@ -20,14 +20,14 @@ impl AudioSink for Discard {
     fn flush(&mut self) {}
 }
 
-async fn start(pincode: Option<&str>) -> SocketAddr {
+async fn start(password: Option<&str>) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let config = Config {
         name: "Test".to_string(),
         port: addr.port(),
         mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
-        pincode: pincode.map(str::to_string),
+        password: password.map(str::to_string),
     };
     let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel();
     let context = Arc::new(Context {
@@ -136,7 +136,7 @@ async fn challenges_until_authorized_then_streams() {
 }
 
 #[tokio::test]
-async fn wrong_pincode_is_refused_and_stays_locked() {
+async fn wrong_password_is_refused_and_stays_locked() {
     let addr = start(Some("1234")).await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
@@ -145,11 +145,14 @@ async fn wrong_pincode_is_refused_and_stays_locked() {
     assert_eq!(status, "RTSP/1.0 401 Unauthorized");
     let nonce = nonce_from_auth(header(&headers, "WWW-Authenticate").unwrap());
 
-    // A wrong pincode computes a different response and is refused.
+    // A wrong password computes a different response and is refused.
     let bad = digest_auth(&nonce, "player", "nope", "OPTIONS", "*");
     let req = format!("OPTIONS * RTSP/1.0\r\nCSeq: 2\r\nAuthorization: {bad}\r\n\r\n");
     let (status, _) = rtsp(&mut stream, &req).await;
-    assert_eq!(status, "RTSP/1.0 401 Unauthorized", "wrong pincode refused");
+    assert_eq!(
+        status, "RTSP/1.0 401 Unauthorized",
+        "wrong password refused"
+    );
 
     // Still not authorized: a later method is challenged too.
     let announce = format!(
@@ -183,7 +186,7 @@ async fn malformed_authorization_header_is_refused() {
 }
 
 #[tokio::test]
-async fn no_pincode_means_no_challenge() {
+async fn no_password_means_no_challenge() {
     let addr = start(None).await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
 
@@ -192,6 +195,6 @@ async fn no_pincode_means_no_challenge() {
     assert_eq!(status, "RTSP/1.0 200 OK");
     assert!(
         header(&headers, "WWW-Authenticate").is_none(),
-        "no pincode, no challenge"
+        "no password, no challenge"
     );
 }

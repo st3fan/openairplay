@@ -38,9 +38,9 @@ synchronisation for a latency-correct start.
   clock and the sound card.
 - **Software volume** from `SET_PARAMETER`, and single-client exclusion (a
   second sender is refused `453`).
-- **Optional pincode protection** — `--pincode CODE` requires a sender to
-  authenticate before it can stream (`pw=1` advertised); without it the
-  receiver is open (`pw=false`). The pincode never appears in the
+- **Optional password protection** — `--password CODE` requires a sender to
+  authenticate before it can stream (`pw=true` advertised); without it the
+  receiver is open (`pw=false`). The password never appears in the
   advertisement, logs, or any response.
 
 Out of scope: AirPlay 2 (HomeKit pairing, PTP multi-room) and video / screen

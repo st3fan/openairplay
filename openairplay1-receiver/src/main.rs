@@ -26,15 +26,15 @@ struct Args {
     log_file: Option<String>,
     /// Address to serve the dashboard WebSocket on; off when `None`.
     dashboard_listen: Option<String>,
-    /// Require this pincode to stream; `None` → open.
-    pincode: Option<String>,
+    /// Require this password to stream; `None` → open.
+    password: Option<String>,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: openairplay1-receiver [--name NAME] [--port PORT] [--mac AA:BB:CC:DD:EE:FF] \
          [--alsa-device DEV] [--no-audio] [--no-avahi] [--log-file PATH] \
-         [--dashboard-listen ADDR] [--pincode CODE]"
+         [--dashboard-listen ADDR] [--password CODE]"
     );
     std::process::exit(2);
 }
@@ -58,7 +58,7 @@ fn parse_args() -> Args {
         alsa_device: Some(DEFAULT_ALSA_DEVICE.to_string()),
         log_file: None,
         dashboard_listen: None,
-        pincode: None,
+        password: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -85,7 +85,7 @@ fn parse_args() -> Args {
             "--dashboard-listen" => {
                 args.dashboard_listen = Some(it.next().unwrap_or_else(|| usage()))
             }
-            "--pincode" => args.pincode = Some(it.next().unwrap_or_else(|| usage())),
+            "--password" => args.password = Some(it.next().unwrap_or_else(|| usage())),
             "--no-avahi" => args.avahi = false,
             "-h" | "--help" => usage(),
             other => {
@@ -171,8 +171,8 @@ async fn main() -> ExitCode {
     if let Some(mac) = args.mac {
         builder = builder.mac(mac);
     }
-    if let Some(pincode) = args.pincode {
-        builder = builder.pincode(pincode);
+    if let Some(password) = args.password {
+        builder = builder.password(password);
     }
     let receiver = match builder.build() {
         Ok(receiver) => receiver,
@@ -188,10 +188,10 @@ async fn main() -> ExitCode {
         receiver.config().mac_hex(),
         receiver.config().port
     );
-    // The pincode is a secret: say whether protection is on, never the value.
-    match &receiver.config().pincode {
-        Some(_) => info!("pincode protection: enabled"),
-        None => info!("pincode protection: disabled"),
+    // The password is a secret: say whether protection is on, never the value.
+    match &receiver.config().password {
+        Some(_) => info!("password protection: enabled"),
+        None => info!("password protection: disabled"),
     }
     match &args.alsa_device {
         Some(dev) => info!("audio output: ALSA \"{dev}\""),

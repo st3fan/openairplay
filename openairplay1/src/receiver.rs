@@ -29,7 +29,7 @@ pub struct ReceiverBuilder {
     port: u16,
     mac: Option<[u8; 6]>,
     advertise: bool,
-    pincode: Option<String>,
+    password: Option<String>,
 }
 
 impl ReceiverBuilder {
@@ -39,7 +39,7 @@ impl ReceiverBuilder {
             port: DEFAULT_PORT,
             mac: None,
             advertise: true,
-            pincode: None,
+            password: None,
         }
     }
 
@@ -73,12 +73,12 @@ impl ReceiverBuilder {
         self
     }
 
-    /// Require a pincode before the receiver will stream to a sender. When
-    /// set, the receiver advertises `pw=1` in `_raop._tcp` so Apple senders
+    /// Require a password before the receiver will stream to a sender. When
+    /// set, the receiver advertises `pw=true` in `_raop._tcp` so Apple senders
     /// know to authenticate; unauthenticated senders are refused at SETUP.
-    /// Default: `None` (no pincode, `pw=false`, accept anything).
-    pub fn pincode(mut self, pincode: impl Into<String>) -> Self {
-        self.pincode = Some(pincode.into());
+    /// Default: `None` (no password, `pw=false`, accept anything).
+    pub fn password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
         self
     }
 
@@ -93,7 +93,7 @@ impl ReceiverBuilder {
                 name: self.name,
                 port: self.port,
                 mac,
-                pincode: self.pincode,
+                password: self.password,
             },
             advertise: self.advertise,
         })
@@ -125,9 +125,9 @@ impl Receiver {
     /// registration (built with `advertise(false)`). Advertise these on
     /// [`Config::port`] under the service name
     /// [`Config::service_name`] (`<MAC>@<Name>`). `pw` reflects the
-    /// configured pincode: `pw=1` when one is set, `pw=false` otherwise.
+    /// configured password: `pw=true` when one is set, `pw=false` otherwise.
     pub fn txt_records(&self) -> Vec<String> {
-        avahi::txt_records(self.config.pincode.as_deref())
+        avahi::txt_records(self.config.password.as_deref())
     }
 
     /// Serve AirPlay on the caller's runtime until a listener error.
@@ -202,19 +202,19 @@ mod tests {
             .port(5001)
             .mac([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
             .advertise(false)
-            .pincode("4321")
+            .password("4321")
             .build()
             .unwrap();
         assert_eq!(receiver.config().name, "Living Room");
         assert_eq!(receiver.config().port, 5001);
-        assert_eq!(receiver.config().pincode.as_deref(), Some("4321"));
+        assert_eq!(receiver.config().password.as_deref(), Some("4321"));
         assert!(!receiver.advertise);
     }
 
     #[test]
-    fn pincode_defaults_to_none() {
+    fn password_defaults_to_none() {
         let receiver = Receiver::builder().build().unwrap();
-        assert_eq!(receiver.config().pincode, None);
+        assert_eq!(receiver.config().password, None);
     }
 
     #[test]
@@ -225,18 +225,18 @@ mod tests {
         assert!(records.iter().any(|r| r == "cn=0,1"));
         assert!(records.iter().any(|r| r == "sr=44100"));
         assert!(records.iter().any(|r| r == "et=0,1"));
-        // No pincode: the receiver is advertised as open.
+        // No password: the receiver is advertised as open.
         assert!(records.iter().any(|r| r == "pw=false"));
-        assert!(!records.iter().any(|r| r.starts_with("pw=1")));
+        assert!(!records.iter().any(|r| r.starts_with("pw=true")));
     }
 
     #[test]
-    fn txt_records_advertise_protection_when_pincode_set() {
-        let receiver = Receiver::builder().pincode("1234").build().unwrap();
+    fn txt_records_advertise_protection_when_password_set() {
+        let receiver = Receiver::builder().password("1234").build().unwrap();
         let records = receiver.txt_records();
         assert!(records.iter().any(|r| r == "pw=true"));
         assert!(!records.iter().any(|r| r == "pw=false"));
-        // The pincode itself is never in the advertisement.
+        // The password itself is never in the advertisement.
         assert!(!records.iter().any(|r| r.contains("1234")));
     }
 }

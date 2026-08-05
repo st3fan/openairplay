@@ -173,18 +173,18 @@ impl Session {
     }
 
     /// Classic AirPlay 1 password check (RFC 2617 Digest), mirroring
-    /// shairport-sync's `rtsp_classic_airplay_auth`. A pincode-protected
+    /// shairport-sync's `rtsp_classic_airplay_auth`. A password-protected
     /// receiver answers every request with `401 + WWW-Authenticate` until the
     /// client supplies a valid `Authorization: Digest` header; a connection
     /// that does is marked authorized for the rest of its session. Without a
-    /// configured pincode every connection is authorized immediately.
+    /// configured password every connection is authorized immediately.
     /// Returns a `401` response when denied, `None` when the request may
     /// proceed to normal dispatch.
-    pub fn authenticate(&mut self, pincode: Option<&str>, request: &Request) -> Option<Response> {
+    pub fn authenticate(&mut self, password: Option<&str>, request: &Request) -> Option<Response> {
         if self.authorized {
             return None;
         }
-        let Some(pincode) = pincode else {
+        let Some(password) = password else {
             self.authorized = true;
             return None;
         };
@@ -204,12 +204,12 @@ impl Session {
         };
         let nonce = self.auth_nonce.clone().unwrap_or_default();
         let expected =
-            crypto::digest_response(username, realm, pincode, &request.method, uri, &nonce);
+            crypto::digest_response(username, realm, password, &request.method, uri, &nonce);
         if crypto::ct_eq_hex(&expected, response) {
             self.authorized = true;
             None
         } else {
-            warn!("Authorization failed: wrong pincode for {uri}");
+            warn!("Authorization failed: wrong password for {uri}");
             Some(self.auth_challenge())
         }
     }

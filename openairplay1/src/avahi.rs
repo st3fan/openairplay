@@ -22,11 +22,11 @@ const PROTO_UNSPEC: i32 = -1;
 /// TXT records matching what shairport-sync advertises in classic
 /// (AirPlay 1) mode: ALAC or PCM (`cn`), optional RSA encryption (`et`),
 /// 44100/16/2 audio. `pw` advertises whether the receiver requires a
-/// pincode to stream: `pw=true` when `pincode` is `Some`, `pw=false`
+/// password to stream: `pw=true` when `password` is `Some`, `pw=false`
 /// otherwise (the boolean shairport-sync and real senders expect — not a
-/// numeric). The pincode itself is never part of the advertisement.
-pub fn txt_records(pincode: Option<&str>) -> Vec<String> {
-    let pw = if pincode.is_some() {
+/// numeric). The password itself is never part of the advertisement.
+pub fn txt_records(password: Option<&str>) -> Vec<String> {
+    let pw = if password.is_some() {
         "pw=true"
     } else {
         "pw=false"
@@ -81,7 +81,7 @@ pub async fn publish(config: &Config) -> zbus::Result<Advertisement> {
         .deserialize()?;
 
     // TXT records are an array of byte arrays (`aay`) in the Avahi API.
-    let txt: Vec<Vec<u8>> = txt_records(config.pincode.as_deref())
+    let txt: Vec<Vec<u8>> = txt_records(config.password.as_deref())
         .into_iter()
         .map(String::into_bytes)
         .collect();

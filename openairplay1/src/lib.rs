@@ -79,10 +79,10 @@ pub struct Config {
     /// The MAC address used in the service name and the `Apple-Challenge`
     /// signature.
     pub mac: [u8; 6],
-    /// `Some` → the receiver requires a pincode to stream (advertised as
-    /// `pw=1` in `_raop._tcp`); `None` (the default) → open (`pw=false`).
-    /// The pincode itself never appears in the advertisement or any log.
-    pub pincode: Option<String>,
+    /// `Some` → the receiver requires a password to stream (advertised as
+    /// `pw=true` in `_raop._tcp`); `None` (the default) → open (`pw=false`).
+    /// The password itself never appears in the advertisement or any log.
+    pub password: Option<String>,
 }
 
 impl Config {

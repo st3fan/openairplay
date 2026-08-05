@@ -164,7 +164,7 @@ pub fn digest_response(
 }
 
 /// A fixed-length, non-short-circuiting comparison for the digest `response`,
-/// so a wrong pincode cannot leak byte position through timing. Both sides
+/// so a wrong password cannot leak byte position through timing. Both sides
 /// are the 32-char lowercase hex of a 16-byte digest, so the length guard
 /// carries no secret-dependent information.
 pub fn ct_eq_hex(expected: &str, provided: &str) -> bool {

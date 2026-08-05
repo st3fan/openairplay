@@ -119,14 +119,14 @@ async fn dispatch(
     local_addr: SocketAddr,
     config: &Config,
 ) -> Response {
-    // Pincode / Digest auth gate (the classic AirPlay 1 password), checked
+    // Password / Digest auth gate (the classic AirPlay 1 password), checked
     // before any method runs, mirroring shairport-sync. A protected receiver
     // challenges with 401 + WWW-Authenticate until the client answers with a
-    // valid `Authorization: Digest` header; without a configured pincode
+    // valid `Authorization: Digest` header; without a configured password
     // every connection is authorized immediately and nothing changes. On a
     // 401 the common headers below (CSeq, Server, Apple-Response) still
     // apply, and the Apple-Challenge is still answered.
-    let mut response = match session.authenticate(config.pincode.as_deref(), request) {
+    let mut response = match session.authenticate(config.password.as_deref(), request) {
         Some(denied) => denied,
         None => match request.method.as_str() {
             "OPTIONS" => Response::ok().header("Public", PUBLIC_METHODS),

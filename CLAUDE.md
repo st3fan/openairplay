@@ -39,8 +39,8 @@ Also out of scope: `PAUSE` (answered `501`), DACP transport control,
 AirPlay 2 (HomeKit pairing, PTP multi-room), video/screen mirroring. The dashboard socket is
 read-only and unauthenticated by design — loopback by default, reverse proxy for anything else.
 
-**Pincode protection** (optional) is plumbed through the library's `Config`/builder
-(`.pincode(..)`) and the receiver's `--pincode`, advertising `pw=true`; the enforcement gate at
+**Password protection** (optional) is plumbed through the library's `Config`/builder
+(`.password(..)`) and the receiver's `--password`, advertising `pw=true`; the enforcement gate at
 SETUP (RFC 2617 `Authorization: Digest`, `realm="raop"`) mirrors shairport-sync. It protects
 *streaming only* — it does **not** protect the dashboard socket (that stays unauthenticated
 loopback), and it never appears in logs, responses, or the advertisement.
