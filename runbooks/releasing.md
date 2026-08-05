@@ -54,9 +54,15 @@ login — and it is the one part of a release that is not automated.
 3. Revoke the API token. From here that crate releases through the tag
    workflow like the others.
 
-Crates already set up this way: `openairplay1`,
-`openairplay1-receiver`. Crates still needing it (never published):
-`openairplay1-dashboard-protocol`, `openairplay1-dashboard`.
+Configured and verified publishing through the workflow:
+`openairplay1`, `openairplay1-dashboard-protocol`,
+`openairplay1-dashboard` (all confirmed during the 0.3.0 release).
+
+**Not configured: `openairplay1-receiver`.** This runbook used to claim
+it was set up with the library in the first release; the 0.3.0 run
+proved otherwise by failing with the 403 below. Publishing it needs a
+trusted publisher added in the crates.io UI — step 2 above — like any
+other crate.
 
 ## Releasing a version
 
@@ -105,6 +111,14 @@ A published version is immutable — it cannot be replaced or deleted.
 Fix forward: `cargo yank --version X.Y.Z -p <crate>` to stop new
 projects resolving the bad version, then release a patch version.
 Yanking never breaks existing `Cargo.lock` users.
+
+**`403 Forbidden: The provided access token is not valid for crate X`**
+means crate X has no trusted publisher configured (or one naming a
+different repository or workflow file). The token the workflow mints is
+only valid for the crates crates.io has been told to trust; nothing in
+the repo can grant it. Add the publisher in the UI, then re-run the
+failed workflow (`gh run rerun <id>`) — no new tag is needed, and the
+crates already published are skipped.
 
 A failed workflow run before the publish step is harmless: fix, delete
 and re-push the tag. If the publish step failed midway, the crates that
