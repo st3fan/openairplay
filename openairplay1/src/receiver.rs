@@ -29,6 +29,7 @@ pub struct ReceiverBuilder {
     port: u16,
     mac: Option<[u8; 6]>,
     advertise: bool,
+    password: Option<String>,
 }
 
 impl ReceiverBuilder {
@@ -38,6 +39,7 @@ impl ReceiverBuilder {
             port: DEFAULT_PORT,
             mac: None,
             advertise: true,
+            password: None,
         }
     }
 
@@ -71,6 +73,15 @@ impl ReceiverBuilder {
         self
     }
 
+    /// Require a password before the receiver will stream to a sender. When
+    /// set, the receiver advertises `pw=true` in `_raop._tcp` so Apple senders
+    /// know to authenticate; unauthenticated senders are refused at SETUP.
+    /// Default: `None` (no password, `pw=false`, accept anything).
+    pub fn password(mut self, password: impl Into<String>) -> Self {
+        self.password = Some(password.into());
+        self
+    }
+
     /// Resolve the MAC and produce a runnable [`Receiver`].
     pub fn build(self) -> io::Result<Receiver> {
         let mac = self.mac.or_else(mac::discover).unwrap_or_else(|| {
@@ -82,6 +93,7 @@ impl ReceiverBuilder {
                 name: self.name,
                 port: self.port,
                 mac,
+                password: self.password,
             },
             advertise: self.advertise,
         })
@@ -112,9 +124,10 @@ impl Receiver {
     /// The `_raop._tcp` TXT records, for hosts that own their mDNS
     /// registration (built with `advertise(false)`). Advertise these on
     /// [`Config::port`] under the service name
-    /// [`Config::service_name`] (`<MAC>@<Name>`).
+    /// [`Config::service_name`] (`<MAC>@<Name>`). `pw` reflects the
+    /// configured password: `pw=true` when one is set, `pw=false` otherwise.
     pub fn txt_records(&self) -> Vec<String> {
-        avahi::txt_records()
+        avahi::txt_records(self.config.password.as_deref())
     }
 
     /// Serve AirPlay on the caller's runtime until a listener error.
@@ -189,11 +202,19 @@ mod tests {
             .port(5001)
             .mac([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
             .advertise(false)
+            .password("4321")
             .build()
             .unwrap();
         assert_eq!(receiver.config().name, "Living Room");
         assert_eq!(receiver.config().port, 5001);
+        assert_eq!(receiver.config().password.as_deref(), Some("4321"));
         assert!(!receiver.advertise);
+    }
+
+    #[test]
+    fn password_defaults_to_none() {
+        let receiver = Receiver::builder().build().unwrap();
+        assert_eq!(receiver.config().password, None);
     }
 
     #[test]
@@ -204,5 +225,18 @@ mod tests {
         assert!(records.iter().any(|r| r == "cn=0,1"));
         assert!(records.iter().any(|r| r == "sr=44100"));
         assert!(records.iter().any(|r| r == "et=0,1"));
+        // No password: the receiver is advertised as open.
+        assert!(records.iter().any(|r| r == "pw=false"));
+        assert!(!records.iter().any(|r| r.starts_with("pw=true")));
+    }
+
+    #[test]
+    fn txt_records_advertise_protection_when_password_set() {
+        let receiver = Receiver::builder().password("1234").build().unwrap();
+        let records = receiver.txt_records();
+        assert!(records.iter().any(|r| r == "pw=true"));
+        assert!(!records.iter().any(|r| r == "pw=false"));
+        // The password itself is never in the advertisement.
+        assert!(!records.iter().any(|r| r.contains("1234")));
     }
 }

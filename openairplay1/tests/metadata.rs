@@ -38,6 +38,7 @@ async fn start() -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<Event>) {
         name: "Test".to_string(),
         port: addr.port(),
         mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        password: None,
     };
     let (events, event_rx) = tokio::sync::mpsc::unbounded_channel();
     let context = Arc::new(Context {

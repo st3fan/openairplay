@@ -12,7 +12,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::sync::OnceLock;
 
-use base64::engine::general_purpose::STANDARD_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::{Oaep, Pkcs1v15Sign, RsaPrivateKey};
@@ -117,6 +117,76 @@ impl fmt::Display for KeyError {
 }
 
 impl std::error::Error for KeyError {}
+
+/// Lowercase hex of the MD5 digest of the concatenated `parts`.
+///
+/// This is the primitive of the classic AirPlay 1 password: the RAOP
+/// `Authorization: Digest` response is nested MD5 (HA1/HA2, below), exactly
+/// as shairport-sync's `rtsp_classic_airplay_auth` computes it.
+fn md5_hex(parts: &[&[u8]]) -> String {
+    use md5::{Digest, Md5};
+    let mut hasher = Md5::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Compute the RFC 2617 `Authorization: Digest` response for the classic
+/// AirPlay 1 password, mirroring shairport-sync:
+///
+/// ```text
+/// HA1      = MD5(username ":" realm ":" password)
+/// HA2      = MD5(method ":" uri)
+/// response = MD5(hex(HA1) ":" nonce ":" hex(HA2))
+/// ```
+pub fn digest_response(
+    username: &str,
+    realm: &str,
+    password: &str,
+    method: &str,
+    uri: &str,
+    nonce: &str,
+) -> String {
+    let ha1 = md5_hex(&[
+        username.as_bytes(),
+        b":",
+        realm.as_bytes(),
+        b":",
+        password.as_bytes(),
+    ]);
+    let ha2 = md5_hex(&[method.as_bytes(), b":", uri.as_bytes()]);
+    md5_hex(&[ha1.as_bytes(), b":", nonce.as_bytes(), b":", ha2.as_bytes()])
+}
+
+/// A fixed-length, non-short-circuiting comparison for the digest `response`,
+/// so a wrong password cannot leak byte position through timing. Both sides
+/// are the 32-char lowercase hex of a 16-byte digest, so the length guard
+/// carries no secret-dependent information.
+pub fn ct_eq_hex(expected: &str, provided: &str) -> bool {
+    let e = expected.as_bytes();
+    let p = provided.as_bytes();
+    if e.len() != p.len() {
+        return false;
+    }
+    let mut acc = 0u8;
+    for i in 0..e.len() {
+        acc |= e[i] ^ p[i];
+    }
+    acc == 0
+}
+
+/// A fresh, unpredictable per-connection nonce for the `WWW-Authenticate`
+/// challenge (8 random bytes, base64), shaped like shairport-sync's.
+pub fn make_nonce() -> String {
+    let mut random = [0u8; 8];
+    getrandom::getrandom(&mut random).expect("getrandom cannot fail");
+    STANDARD.encode(random)
+}
 
 #[cfg(test)]
 mod tests {
@@ -227,5 +297,36 @@ mod tests {
         // Random bytes of the right RSA size decrypt-fail under OAEP.
         let bogus = vec![0x42u8; 256];
         assert_eq!(decrypt_aes_key(&bogus).unwrap_err(), KeyError::Decrypt);
+    }
+
+    #[test]
+    fn md5_hex_matches_known_vectors() {
+        assert_eq!(md5_hex(&[]), "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(md5_hex(&[b"abc"]), "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn digest_response_matches_reference() {
+        // Independent vector, computed by hand with Python's hashlib (not the
+        // md5 crate): HA1 = MD5(dev:raop:1234), HA2 = MD5(SETUP:rtsp://…),
+        // response = MD5(HA1:nonce:HA2).
+        let got = digest_response(
+            "dev",
+            "raop",
+            "1234",
+            "SETUP",
+            "rtsp://127.0.0.1/1",
+            "NjM4MDAwMDAx",
+        );
+        assert_eq!(got, "556e89d3c27fc12841e76d2dc2d67dc4");
+    }
+
+    #[test]
+    fn ct_eq_hex_matches_and_differs() {
+        let a = "556e89d3c27fc12841e76d2dc2d67dc4";
+        let b = "556e89d3c27fc12841e76d2dc2d67dc5";
+        assert!(ct_eq_hex(a, a));
+        assert!(!ct_eq_hex(a, b));
+        assert!(!ct_eq_hex(a, "deadbeef")); // wrong length
     }
 }

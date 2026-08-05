@@ -21,8 +21,16 @@ const PROTO_UNSPEC: i32 = -1;
 
 /// TXT records matching what shairport-sync advertises in classic
 /// (AirPlay 1) mode: ALAC or PCM (`cn`), optional RSA encryption (`et`),
-/// 44100/16/2 audio, no password.
-pub fn txt_records() -> Vec<String> {
+/// 44100/16/2 audio. `pw` advertises whether the receiver requires a
+/// password to stream: `pw=true` when `password` is `Some`, `pw=false`
+/// otherwise (the boolean shairport-sync and real senders expect — not a
+/// numeric). The password itself is never part of the advertisement.
+pub fn txt_records(password: Option<&str>) -> Vec<String> {
+    let pw = if password.is_some() {
+        "pw=true"
+    } else {
+        "pw=false"
+    };
     [
         "txtvers=1",
         "ch=2",
@@ -33,7 +41,7 @@ pub fn txt_records() -> Vec<String> {
         "da=true",
         "sr=44100",
         "ss=16",
-        "pw=false",
+        pw,
         "vn=65537",
         "tp=UDP",
         "md=0,1,2",
@@ -73,7 +81,10 @@ pub async fn publish(config: &Config) -> zbus::Result<Advertisement> {
         .deserialize()?;
 
     // TXT records are an array of byte arrays (`aay`) in the Avahi API.
-    let txt: Vec<Vec<u8>> = txt_records().into_iter().map(String::into_bytes).collect();
+    let txt: Vec<Vec<u8>> = txt_records(config.password.as_deref())
+        .into_iter()
+        .map(String::into_bytes)
+        .collect();
 
     // AddService(interface, protocol, flags, name, type, domain, host, port, txt).
     // Empty domain/host let Avahi use the local defaults (e.g. bee.local).

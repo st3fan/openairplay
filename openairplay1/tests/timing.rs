@@ -34,6 +34,7 @@ async fn start() -> (
         name: "Test".to_string(),
         port: addr.port(),
         mac: [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        password: None,
     };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel();
