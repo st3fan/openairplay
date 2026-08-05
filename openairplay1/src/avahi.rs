@@ -22,11 +22,12 @@ const PROTO_UNSPEC: i32 = -1;
 /// TXT records matching what shairport-sync advertises in classic
 /// (AirPlay 1) mode: ALAC or PCM (`cn`), optional RSA encryption (`et`),
 /// 44100/16/2 audio. `pw` advertises whether the receiver requires a
-/// pincode to stream: `pw=1` when `pincode` is `Some`, `pw=false`
-/// otherwise. The pincode itself is never part of the advertisement.
+/// pincode to stream: `pw=true` when `pincode` is `Some`, `pw=false`
+/// otherwise (the boolean shairport-sync and real senders expect — not a
+/// numeric). The pincode itself is never part of the advertisement.
 pub fn txt_records(pincode: Option<&str>) -> Vec<String> {
     let pw = if pincode.is_some() {
-        "pw=1"
+        "pw=true"
     } else {
         "pw=false"
     };

@@ -131,6 +131,10 @@ pub struct Session {
     /// Shared single-session gate and this session's guard once acquired.
     slot: SessionSlot,
     slot_guard: Option<SlotGuard>,
+    /// Classic AirPlay 1 password (Digest auth): the per-connection challenge
+    /// nonce once issued, and whether this connection has authenticated.
+    auth_nonce: Option<String>,
+    authorized: bool,
     /// Local UDP ports handed to the client in the SETUP response.
     local_audio_port: u16,
     local_control_port: u16,
@@ -158,12 +162,67 @@ impl Session {
             peer_ip,
             slot,
             slot_guard: None,
+            auth_nonce: None,
+            authorized: false,
             params: None,
             tasks: Vec::new(),
             local_audio_port: 0,
             local_control_port: 0,
             local_timing_port: 0,
         }
+    }
+
+    /// Classic AirPlay 1 password check (RFC 2617 Digest), mirroring
+    /// shairport-sync's `rtsp_classic_airplay_auth`. A pincode-protected
+    /// receiver answers every request with `401 + WWW-Authenticate` until the
+    /// client supplies a valid `Authorization: Digest` header; a connection
+    /// that does is marked authorized for the rest of its session. Without a
+    /// configured pincode every connection is authorized immediately.
+    /// Returns a `401` response when denied, `None` when the request may
+    /// proceed to normal dispatch.
+    pub fn authenticate(&mut self, pincode: Option<&str>, request: &Request) -> Option<Response> {
+        if self.authorized {
+            return None;
+        }
+        let Some(pincode) = pincode else {
+            self.authorized = true;
+            return None;
+        };
+        let Some(auth) = request.headers.get("Authorization") else {
+            return Some(self.auth_challenge());
+        };
+        if !auth.starts_with("Digest ") {
+            return Some(self.auth_challenge());
+        }
+        let (Some(realm), Some(username), Some(response), Some(uri)) = (
+            digest_param(auth, "realm"),
+            digest_param(auth, "username"),
+            digest_param(auth, "response"),
+            digest_param(auth, "uri"),
+        ) else {
+            return Some(self.auth_challenge());
+        };
+        let nonce = self.auth_nonce.clone().unwrap_or_default();
+        let expected =
+            crypto::digest_response(username, realm, pincode, &request.method, uri, &nonce);
+        if crypto::ct_eq_hex(&expected, response) {
+            self.authorized = true;
+            None
+        } else {
+            warn!("Authorization failed: wrong pincode for {uri}");
+            Some(self.auth_challenge())
+        }
+    }
+
+    /// Issue a `401 Unauthorized` carrying the connection's nonce, creating
+    /// it on the first challenge so the client can answer it on its next
+    /// request.
+    fn auth_challenge(&mut self) -> Response {
+        let nonce = self.auth_nonce.get_or_insert_with(crypto::make_nonce);
+        Response::new(401, "Unauthorized").header(
+            "WWW-Authenticate",
+            format!("Digest realm=\"raop\", nonce=\"{nonce}\""),
+        )
     }
 
     /// Handle ANNOUNCE: parse SDP, decrypt the session key, store format and
@@ -563,6 +622,15 @@ fn transport_param(header: &str, name: &str) -> Option<u16> {
         .split(';')
         .find_map(|kv| kv.trim().strip_prefix(&format!("{name}=")))
         .and_then(|v| v.trim().parse().ok())
+}
+
+/// Extract `key="value"` from an RFC 2617 `Authorization: Digest` header.
+fn digest_param<'a>(auth: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("{key}=\"");
+    let start = auth.find(&needle)?;
+    let value = &auth[start + needle.len()..];
+    let end = value.find('"')?;
+    Some(&value[..end])
 }
 
 async fn bind_three(ip: IpAddr) -> io::Result<(UdpSocket, UdpSocket, UdpSocket)> {

@@ -234,7 +234,7 @@ mod tests {
     fn txt_records_advertise_protection_when_pincode_set() {
         let receiver = Receiver::builder().pincode("1234").build().unwrap();
         let records = receiver.txt_records();
-        assert!(records.iter().any(|r| r == "pw=1"));
+        assert!(records.iter().any(|r| r == "pw=true"));
         assert!(!records.iter().any(|r| r == "pw=false"));
         // The pincode itself is never in the advertisement.
         assert!(!records.iter().any(|r| r.contains("1234")));

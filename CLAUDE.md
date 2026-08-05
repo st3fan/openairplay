@@ -40,10 +40,10 @@ AirPlay 2 (HomeKit pairing, PTP multi-room), video/screen mirroring. The dashboa
 read-only and unauthenticated by design — loopback by default, reverse proxy for anything else.
 
 **Pincode protection** (optional) is plumbed through the library's `Config`/builder
-(`.pincode(..)`) and the receiver's `--pincode`, advertising `pw=1`; the enforcement gate at
-SETUP is a separate phase and not wired up yet. The pincode protects *streaming only* — it
-does **not** protect the dashboard socket (that stays unauthenticated loopback), and it never
-appears in logs, responses, or the advertisement.
+(`.pincode(..)`) and the receiver's `--pincode`, advertising `pw=true`; the enforcement gate at
+SETUP (RFC 2617 `Authorization: Digest`, `realm="raop"`) mirrors shairport-sync. It protects
+*streaming only* — it does **not** protect the dashboard socket (that stays unauthenticated
+loopback), and it never appears in logs, responses, or the advertisement.
 
 ## Build, test, run
 
